@@ -12,7 +12,7 @@ HEADERS = {"Authorization": "Bearer 123456789"}
 
 
 async def main() -> None:
-    async with streamablehttp_client(REMOTE_URL, headers=HEADERS) as (read, write, _):
+    async with streamablehttp_client(REMOTE_URL, headers=HEADERS, timeout=180) as (read, write, _):
         async with ClientSession(read, write) as remote:
             await remote.initialize()
 
