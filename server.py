@@ -302,7 +302,7 @@ CAPITALS: dict[str, str] = {
 # MCP tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(timeout=180)
+@mcp.tool()
 async def fetch_acled_events(
     country: str,
     date_from: str,
@@ -319,34 +319,40 @@ async def fetch_acled_events(
         event_type: Optional event type filter (e.g. "Battles", "Protests").
         limit: Maximum number of records to return (default 5000).
     """
-    token = await get_token()
-    canonical = resolve_country(country)
-    if canonical is None:
-        return {"error": f"Unrecognised country: '{country}'. Check spelling or use an ISO code."}
-    params: dict[str, str | int] = {
-        "country": canonical,
-        "event_date": f"{date_from}|{date_to}",
-        "event_date_where": "BETWEEN",
-        "limit": limit,
-    }
-    if event_type:
-        params["event_type"] = event_type
+    async def _impl():
+        token = await get_token()
+        canonical = resolve_country(country)
+        if canonical is None:
+            return {"error": f"Unrecognised country: '{country}'. Check spelling or use an ISO code."}
+        params: dict[str, str | int] = {
+            "country": canonical,
+            "event_date": f"{date_from}|{date_to}",
+            "event_date_where": "BETWEEN",
+            "limit": limit,
+        }
+        if event_type:
+            params["event_type"] = event_type
 
-    logging.info("Calling ACLED API: %s %s", ACLED_API_URL, params)
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.get(
-            ACLED_API_URL,
-            params=params,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        logging.info("ACLED response status: %s", resp.status_code)
-        if resp.status_code != 200:
-            logging.error("ACLED error body: %s", resp.text)
-        resp.raise_for_status()
-        return resp.json()
+        logging.info("Calling ACLED API: %s %s", ACLED_API_URL, params)
+        async with httpx.AsyncClient(timeout=180) as client:
+            resp = await client.get(
+                ACLED_API_URL,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            logging.info("ACLED response status: %s", resp.status_code)
+            if resp.status_code != 200:
+                logging.error("ACLED error body: %s", resp.text)
+            resp.raise_for_status()
+            return resp.json()
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=180)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 180 seconds"}
 
 
-@mcp.tool(timeout=180)
+@mcp.tool()
 async def run_africa_report(
     facility_lat: float | None = None,
     facility_lon: float | None = None,
@@ -362,74 +368,80 @@ async def run_africa_report(
         facility_lon: Optional longitude of an operating facility for
                       Trigger 2 (armed group proximity) checks.
     """
-    date_to = date.today()
-    date_from = date_to - timedelta(days=30)
-    date_from_str = date_from.isoformat()
-    date_to_str = date_to.isoformat()
+    async def _impl():
+        date_to = date.today()
+        date_from = date_to - timedelta(days=30)
+        date_from_str = date_from.isoformat()
+        date_to_str = date_to.isoformat()
 
-    facility_coords: tuple[float, float] | None = None
-    if facility_lat is not None and facility_lon is not None:
-        facility_coords = (facility_lat, facility_lon)
+        facility_coords: tuple[float, float] | None = None
+        if facility_lat is not None and facility_lon is not None:
+            facility_coords = (facility_lat, facility_lon)
 
-    token = await get_token()
+        token = await get_token()
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        tasks = [
-            _fetch_country(client, token, country, date_from_str, date_to_str)
-            for country in ACLED_NAMES
-        ]
-        results = await asyncio.gather(*tasks)
+        async with httpx.AsyncClient(timeout=180) as client:
+            tasks = [
+                _fetch_country(client, token, country, date_from_str, date_to_str)
+                for country in ACLED_NAMES
+            ]
+            results = await asyncio.gather(*tasks)
 
-    country_events: dict[str, list[dict]] = dict(zip(ACLED_NAMES, results))
+        country_events: dict[str, list[dict]] = dict(zip(ACLED_NAMES, results))
 
-    report: dict[str, dict] = {}
+        report: dict[str, dict] = {}
 
-    for country, events in country_events.items():
-        if not events:
-            continue
+        for country, events in country_events.items():
+            if not events:
+                continue
 
-        alerts: dict = {}
+            alerts: dict = {}
 
-        # Trigger 1 — week-on-week escalation
-        t1 = _check_trigger_1(events)
-        if t1:
-            alerts["trigger_1_escalation"] = t1
+            # Trigger 1 — week-on-week escalation
+            t1 = _check_trigger_1(events)
+            if t1:
+                alerts["trigger_1_escalation"] = t1
 
-        # Trigger 2 — armed group proximity (only if coordinates provided)
-        if facility_coords:
-            t2 = _check_trigger_2(events, facility_coords[0], facility_coords[1])
-            if t2:
-                alerts["trigger_2_armed_proximity"] = t2
+            # Trigger 2 — armed group proximity (only if coordinates provided)
+            if facility_coords:
+                t2 = _check_trigger_2(events, facility_coords[0], facility_coords[1])
+                if t2:
+                    alerts["trigger_2_armed_proximity"] = t2
 
-        # Trigger 3 — foreign national kidnappings
-        t3 = _check_trigger_3(events)
-        if t3:
-            alerts["trigger_3_kidnappings"] = t3
+            # Trigger 3 — foreign national kidnappings
+            t3 = _check_trigger_3(events)
+            if t3:
+                alerts["trigger_3_kidnappings"] = t3
 
-        # Trigger 4 — sustained/multi-city protests
-        capital = CAPITALS.get(country, "")
-        t4 = _check_trigger_4(events, capital)
-        if t4:
-            alerts["trigger_4_protests"] = t4
+            # Trigger 4 — sustained/multi-city protests
+            capital = CAPITALS.get(country, "")
+            t4 = _check_trigger_4(events, capital)
+            if t4:
+                alerts["trigger_4_protests"] = t4
 
-        # Trigger 5 — demonstrations near diplomatic/facility premises
-        t5 = _check_trigger_5(events, facility_coords)
-        if t5:
-            alerts["trigger_5_diplomatic"] = t5
+            # Trigger 5 — demonstrations near diplomatic/facility premises
+            t5 = _check_trigger_5(events, facility_coords)
+            if t5:
+                alerts["trigger_5_diplomatic"] = t5
 
-        if alerts:
-            report[country] = {
-                "total_events_30d": len(events),
-                "alerts": alerts,
-            }
+            if alerts:
+                report[country] = {
+                    "total_events_30d": len(events),
+                    "alerts": alerts,
+                }
 
-    return {
-        "report_date": date_to_str,
-        "period": f"{date_from_str} to {date_to_str}",
-        "countries_with_alerts": len(report),
-        "facility_coords_used": facility_coords,
-        "results": report,
-    }
+        return {
+            "report_date": date_to_str,
+            "period": f"{date_from_str} to {date_to_str}",
+            "countries_with_alerts": len(report),
+            "facility_coords_used": facility_coords,
+            "results": report,
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=180)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 180 seconds"}
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +520,7 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
 # OpenSky MCP tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(timeout=300)
+@mcp.tool()
 async def fetch_airport_activity(
     airport_icao: str,
     days_back: int = 7,
@@ -519,28 +531,34 @@ async def fetch_airport_activity(
         airport_icao: ICAO airport code (e.g. "HKJK" for Nairobi, "FAOR" for Johannesburg).
         days_back: Number of days to look back, max 7 (default 7).
     """
-    days_back = min(max(days_back, 1), 7)
-    icao = airport_icao.upper().strip()
-    airport = get_airport(icao)
-    if airport is None:
-        return {"error": f"Airport '{icao}' not found in African airport database."}
+    async def _impl():
+        _days_back = min(max(days_back, 1), 7)
+        icao = airport_icao.upper().strip()
+        airport = get_airport(icao)
+        if airport is None:
+            return {"error": f"Airport '{icao}' not found in African airport database."}
 
-    end_ts = int(time.time())
-    begin_ts = end_ts - (days_back * 86400)
+        end_ts = int(time.time())
+        begin_ts = end_ts - (_days_back * 86400)
 
-    async with httpx.AsyncClient(timeout=300) as client:
-        result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
+        async with httpx.AsyncClient(timeout=300) as client:
+            result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
 
-    summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-    return {
-        "airport": airport,
-        "period_days": days_back,
-        **summary,
-        "error": result["error"],
-    }
+        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+        return {
+            "airport": airport,
+            "period_days": _days_back,
+            **summary,
+            "error": result["error"],
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=300)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 300 seconds"}
 
 
-@mcp.tool(timeout=300)
+@mcp.tool()
 async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     """Run OpenSky Data across all major African airports over the past 3 days.
 
@@ -551,65 +569,71 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     Args:
         reduction_threshold_pct: Minimum % reduction in flights to include an airport (default 25.0).
     """
-    end_ts = int(time.time())
-    begin_ts = end_ts - (3 * 86400)
+    async def _impl():
+        end_ts = int(time.time())
+        begin_ts = end_ts - (3 * 86400)
 
-    async with httpx.AsyncClient(timeout=300) as client:
-        tasks = [
-            _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
-            for airport in AFRICAN_AIRPORTS
-        ]
-        results = await asyncio.gather(*tasks)
+        async with httpx.AsyncClient(timeout=300) as client:
+            tasks = [
+                _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
+                for airport in AFRICAN_AIRPORTS
+            ]
+            results = await asyncio.gather(*tasks)
 
-    # Group by country, only including airports with >= threshold reduction
-    country_report: dict[str, dict] = {}
-    airports_checked = 0
-    airports_flagged = 0
+        # Group by country, only including airports with >= threshold reduction
+        country_report: dict[str, dict] = {}
+        airports_checked = 0
+        airports_flagged = 0
 
-    for airport_data, result in zip(AFRICAN_AIRPORTS, results):
-        airports_checked += 1
+        for airport_data, result in zip(AFRICAN_AIRPORTS, results):
+            airports_checked += 1
 
-        # Primary filter: skip airports with no flight data before any further processing
-        all_flights = result["departures"] + result["arrivals"]
-        if not all_flights:
-            continue
+            # Primary filter: skip airports with no flight data before any further processing
+            all_flights = result["departures"] + result["arrivals"]
+            if not all_flights:
+                continue
 
-        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+            summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
 
-        # Primary filter: must meet reduction threshold
-        if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
-            continue
+            # Primary filter: must meet reduction threshold
+            if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
+                continue
 
-        airports_flagged += 1
-        country = airport_data["country"]
-        if country not in country_report:
-            country_report[country] = {"airports": [], "total_flights": 0}
+            airports_flagged += 1
+            country = airport_data["country"]
+            if country not in country_report:
+                country_report[country] = {"airports": [], "total_flights": 0}
 
-        country_report[country]["airports"].append({
-            "icao": airport_data["icao"],
-            "name": airport_data["name"],
-            "city": airport_data["city"],
-            **summary,
-        })
-        country_report[country]["total_flights"] += summary["total_flights"]
+            country_report[country]["airports"].append({
+                "icao": airport_data["icao"],
+                "name": airport_data["name"],
+                "city": airport_data["city"],
+                **summary,
+            })
+            country_report[country]["total_flights"] += summary["total_flights"]
 
-    from datetime import datetime
-    return {
-        "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-        "period": "past 3 days",
-        "reduction_threshold_pct": reduction_threshold_pct,
-        "airports_checked": airports_checked,
-        "airports_flagged": airports_flagged,
-        "countries_with_reductions": len(country_report),
-        "results": country_report,
-    }
+        from datetime import datetime
+        return {
+            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "period": "past 3 days",
+            "reduction_threshold_pct": reduction_threshold_pct,
+            "airports_checked": airports_checked,
+            "airports_flagged": airports_flagged,
+            "countries_with_reductions": len(country_report),
+            "results": country_report,
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=300)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 300 seconds"}
 
 
 # ---------------------------------------------------------------------------
 # Diagnostic tool
 # ---------------------------------------------------------------------------
 
-@mcp.tool(timeout=30)
+@mcp.tool()
 async def test_connectivity() -> dict:
     """Test outbound connectivity to ACLED and OpenSky APIs.
 
