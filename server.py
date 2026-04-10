@@ -514,7 +514,7 @@ async def fetch_airport_activity(
     end_ts = int(time.time())
     begin_ts = end_ts - (days_back * 86400)
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
 
     summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
@@ -540,7 +540,7 @@ async def run_opensky_report(reduction_threshold_pct: float = 4.0) -> dict:
     end_ts = int(time.time())
     begin_ts = end_ts - (3 * 86400)
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         tasks = [
             _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
             for airport in AFRICAN_AIRPORTS
@@ -553,10 +553,16 @@ async def run_opensky_report(reduction_threshold_pct: float = 4.0) -> dict:
     airports_flagged = 0
 
     for airport_data, result in zip(AFRICAN_AIRPORTS, results):
-        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
         airports_checked += 1
 
-        # Only include if reduction meets threshold (reduction_pct > 0 means traffic fell)
+        # Primary filter: skip airports with no flight data before any further processing
+        all_flights = result["departures"] + result["arrivals"]
+        if not all_flights:
+            continue
+
+        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+
+        # Primary filter: must meet reduction threshold
         if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
             continue
 
