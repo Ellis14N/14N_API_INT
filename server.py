@@ -10,7 +10,11 @@ ACLED_API_URL = "https://api.acleddata.com/acled/read"
 ACLED_API_KEY = os.getenv("ACLED_API_KEY", "")
 ACLED_EMAIL = os.getenv("ACLED_EMAIL", "")
 
-mcp = FastMCP("14N API Integration")
+mcp = FastMCP(
+    "14N API Integration",
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", "8000")),
+)
 
 
 @mcp.tool()
@@ -50,4 +54,4 @@ async def fetch_acled_events(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="streamable-http")
