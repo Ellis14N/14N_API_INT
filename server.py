@@ -302,7 +302,7 @@ CAPITALS: dict[str, str] = {
 # MCP tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(timeout=180)
 async def fetch_acled_events(
     country: str,
     date_from: str,
@@ -346,7 +346,7 @@ async def fetch_acled_events(
         return resp.json()
 
 
-@mcp.tool()
+@mcp.tool(timeout=180)
 async def run_africa_report(
     facility_lat: float | None = None,
     facility_lon: float | None = None,
@@ -508,7 +508,7 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
 # OpenSky MCP tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(timeout=300)
 async def fetch_airport_activity(
     airport_icao: str,
     days_back: int = 7,
@@ -540,7 +540,7 @@ async def fetch_airport_activity(
     }
 
 
-@mcp.tool()
+@mcp.tool(timeout=300)
 async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     """Run OpenSky Data across all major African airports over the past 3 days.
 
@@ -609,7 +609,7 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
 # Diagnostic tool
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(timeout=30)
 async def test_connectivity() -> dict:
     """Test outbound connectivity to ACLED and OpenSky APIs.
 
