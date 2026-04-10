@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 from countries import ACLED_NAMES, resolve_country
+from airports import AFRICAN_AIRPORTS, AIRPORTS_BY_COUNTRY, get_airport
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -18,6 +19,10 @@ ACLED_API_URL = "https://acleddata.com/api/acled/read"
 ACLED_TOKEN_URL = "https://acleddata.com/oauth/token"
 ACLED_USERNAME = os.getenv("ACLED_USERNAME", "")
 ACLED_PASSWORD = os.getenv("ACLED_PASSWORD", "")
+
+OPENSKY_API_URL = "https://opensky-network.org/api"
+OPENSKY_USERNAME = os.getenv("OPENSKY_USERNAME", "")
+OPENSKY_PASSWORD = os.getenv("OPENSKY_PASSWORD", "")
 
 DIPLOMATIC_KEYWORDS = [
     "embassy", "embassies", "consulate", "consular", "diplomatic",
@@ -410,6 +415,151 @@ async def run_africa_report(
         "countries_with_alerts": len(report),
         "facility_coords_used": facility_coords,
         "results": report,
+    }
+
+
+# ---------------------------------------------------------------------------
+# OpenSky helpers
+# ---------------------------------------------------------------------------
+
+async def _fetch_opensky_airport(
+    client: httpx.AsyncClient,
+    icao: str,
+    begin: int,
+    end: int,
+) -> dict:
+    """Fetch departures and arrivals for one airport from OpenSky."""
+    auth = (OPENSKY_USERNAME, OPENSKY_PASSWORD)
+    results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
+
+    try:
+        dep = await client.get(
+            f"{OPENSKY_API_URL}/flights/departure",
+            params={"airport": icao, "begin": begin, "end": end},
+            auth=auth,
+        )
+        arr = await client.get(
+            f"{OPENSKY_API_URL}/flights/arrival",
+            params={"airport": icao, "begin": begin, "end": end},
+            auth=auth,
+        )
+        results["departures"] = dep.json() if dep.status_code == 200 else []
+        results["arrivals"] = arr.json() if arr.status_code == 200 else []
+        if dep.status_code not in (200, 404):
+            logging.warning("OpenSky %s departure: %s", icao, dep.status_code)
+        if arr.status_code not in (200, 404):
+            logging.warning("OpenSky %s arrival: %s", icao, arr.status_code)
+    except Exception as e:
+        results["error"] = str(e)
+        logging.error("OpenSky fetch error for %s: %s", icao, e)
+
+    return results
+
+
+def _summarise_flights(departures: list, arrivals: list) -> dict:
+    """Build a summary with totals and weekly time series."""
+    from collections import defaultdict
+
+    all_flights = departures + arrivals
+    weekly: dict[str, int] = defaultdict(int)
+
+    for flight in all_flights:
+        ts = flight.get("firstSeen") or flight.get("lastSeen")
+        if not ts:
+            continue
+        from datetime import datetime
+        d = datetime.utcfromtimestamp(ts)
+        week_start = d - timedelta(days=d.weekday())
+        key = week_start.strftime("%Y-%m-%d")
+        weekly[key] += 1
+
+    return {
+        "total_flights": len(all_flights),
+        "total_departures": len(departures),
+        "total_arrivals": len(arrivals),
+        "weekly_series": dict(sorted(weekly.items())),
+    }
+
+
+# ---------------------------------------------------------------------------
+# OpenSky MCP tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def fetch_airport_activity(
+    airport_icao: str,
+    days_back: int = 7,
+) -> dict:
+    """Fetch departures and arrivals for a specific African airport over the past N days.
+
+    Args:
+        airport_icao: ICAO airport code (e.g. "HKJK" for Nairobi, "FAOR" for Johannesburg).
+        days_back: Number of days to look back, max 7 (default 7).
+    """
+    days_back = min(max(days_back, 1), 7)
+    icao = airport_icao.upper().strip()
+    airport = get_airport(icao)
+    if airport is None:
+        return {"error": f"Airport '{icao}' not found in African airport database."}
+
+    end_ts = int(time.time())
+    begin_ts = end_ts - (days_back * 86400)
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
+
+    summary = _summarise_flights(result["departures"], result["arrivals"])
+    return {
+        "airport": airport,
+        "period_days": days_back,
+        **summary,
+        "error": result["error"],
+    }
+
+
+@mcp.tool()
+async def run_opensky_report() -> dict:
+    """Run OpenSky Data across all major African airports over the past 7 days.
+
+    Returns a structured country-by-country aviation activity report including
+    total departures, arrivals, and weekly flight series per airport.
+    """
+    end_ts = int(time.time())
+    begin_ts = end_ts - (7 * 86400)
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        tasks = [
+            _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
+            for airport in AFRICAN_AIRPORTS
+        ]
+        results = await asyncio.gather(*tasks)
+
+    # Group by country
+    country_report: dict[str, dict] = {}
+    for airport_data, result in zip(AFRICAN_AIRPORTS, results):
+        country = airport_data["country"]
+        summary = _summarise_flights(result["departures"], result["arrivals"])
+
+        if country not in country_report:
+            country_report[country] = {"airports": [], "total_flights": 0}
+
+        country_report[country]["airports"].append({
+            "icao": airport_data["icao"],
+            "name": airport_data["name"],
+            "city": airport_data["city"],
+            **summary,
+        })
+        country_report[country]["total_flights"] += summary["total_flights"]
+
+    # Drop countries with zero activity
+    country_report = {k: v for k, v in country_report.items() if v["total_flights"] > 0}
+
+    from datetime import datetime
+    return {
+        "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "period": "past 7 days",
+        "countries_with_activity": len(country_report),
+        "results": country_report,
     }
 
 
