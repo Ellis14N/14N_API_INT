@@ -456,28 +456,37 @@ async def _fetch_opensky_airport(
     return results
 
 
-def _summarise_flights(departures: list, arrivals: list) -> dict:
-    """Build a summary with totals and weekly time series."""
+def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = None, end_ts: int | None = None) -> dict:
+    """Build a summary with totals, daily time series, and trend vs first half of window."""
     from collections import defaultdict
+    from datetime import datetime
 
     all_flights = departures + arrivals
-    weekly: dict[str, int] = defaultdict(int)
+    daily: dict[str, int] = defaultdict(int)
 
     for flight in all_flights:
         ts = flight.get("firstSeen") or flight.get("lastSeen")
         if not ts:
             continue
-        from datetime import datetime
         d = datetime.utcfromtimestamp(ts)
-        week_start = d - timedelta(days=d.weekday())
-        key = week_start.strftime("%Y-%m-%d")
-        weekly[key] += 1
+        key = d.strftime("%Y-%m-%d")
+        daily[key] += 1
+
+    # Calculate reduction % if window boundaries provided
+    reduction_pct: float | None = None
+    if begin_ts is not None and end_ts is not None:
+        mid_ts = (begin_ts + end_ts) / 2
+        first_half = [f for f in all_flights if (f.get("firstSeen") or f.get("lastSeen") or 0) < mid_ts]
+        second_half = [f for f in all_flights if (f.get("firstSeen") or f.get("lastSeen") or 0) >= mid_ts]
+        if len(first_half) > 0:
+            reduction_pct = round((len(first_half) - len(second_half)) / len(first_half) * 100, 1)
 
     return {
         "total_flights": len(all_flights),
         "total_departures": len(departures),
         "total_arrivals": len(arrivals),
-        "weekly_series": dict(sorted(weekly.items())),
+        "daily_series": dict(sorted(daily.items())),
+        "reduction_pct": reduction_pct,
     }
 
 
@@ -508,7 +517,7 @@ async def fetch_airport_activity(
     async with httpx.AsyncClient(timeout=60) as client:
         result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
 
-    summary = _summarise_flights(result["departures"], result["arrivals"])
+    summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
     return {
         "airport": airport,
         "period_days": days_back,
@@ -518,14 +527,18 @@ async def fetch_airport_activity(
 
 
 @mcp.tool()
-async def run_opensky_report() -> dict:
-    """Run OpenSky Data across all major African airports over the past 7 days.
+async def run_opensky_report(reduction_threshold_pct: float = 4.0) -> dict:
+    """Run OpenSky Data across all major African airports over the past 3 days.
 
-    Returns a structured country-by-country aviation activity report including
-    total departures, arrivals, and weekly flight series per airport.
+    Returns airports that have experienced a reduction in air traffic of at least
+    reduction_threshold_pct% (default 4%), comparing the first half of the window
+    to the second half.
+
+    Args:
+        reduction_threshold_pct: Minimum % reduction in flights to include an airport (default 4.0).
     """
     end_ts = int(time.time())
-    begin_ts = end_ts - (7 * 86400)
+    begin_ts = end_ts - (3 * 86400)
 
     async with httpx.AsyncClient(timeout=120) as client:
         tasks = [
@@ -534,12 +547,21 @@ async def run_opensky_report() -> dict:
         ]
         results = await asyncio.gather(*tasks)
 
-    # Group by country
+    # Group by country, only including airports with >= threshold reduction
     country_report: dict[str, dict] = {}
-    for airport_data, result in zip(AFRICAN_AIRPORTS, results):
-        country = airport_data["country"]
-        summary = _summarise_flights(result["departures"], result["arrivals"])
+    airports_checked = 0
+    airports_flagged = 0
 
+    for airport_data, result in zip(AFRICAN_AIRPORTS, results):
+        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+        airports_checked += 1
+
+        # Only include if reduction meets threshold (reduction_pct > 0 means traffic fell)
+        if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
+            continue
+
+        airports_flagged += 1
+        country = airport_data["country"]
         if country not in country_report:
             country_report[country] = {"airports": [], "total_flights": 0}
 
@@ -551,14 +573,14 @@ async def run_opensky_report() -> dict:
         })
         country_report[country]["total_flights"] += summary["total_flights"]
 
-    # Drop countries with zero activity
-    country_report = {k: v for k, v in country_report.items() if v["total_flights"] > 0}
-
     from datetime import datetime
     return {
         "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-        "period": "past 7 days",
-        "countries_with_activity": len(country_report),
+        "period": "past 3 days",
+        "reduction_threshold_pct": reduction_threshold_pct,
+        "airports_checked": airports_checked,
+        "airports_flagged": airports_flagged,
+        "countries_with_reductions": len(country_report),
         "results": country_report,
     }
 
