@@ -9,6 +9,20 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+# ---------------------------------------------------------------------------
+# Timeout configuration
+# ---------------------------------------------------------------------------
+# Timeouts are intentionally generous to accommodate:
+#   - Concurrent requests to 54+ African airports via OpenSky (up to 300 s)
+#   - ACLED API responses that vary with data volume (up to 180 s)
+#   - Unpredictable network latency on external API calls
+# get_token:             60 s  — single auth POST, elevated from 30 s
+# fetch_acled_events:   180 s  — single-country ACLED query
+# run_africa_report:    180 s  — 54-country concurrent ACLED gather
+# fetch_airport_activity: 300 s — single-airport OpenSky query
+# run_opensky_report:   300 s  — all-airport concurrent OpenSky gather
+# ---------------------------------------------------------------------------
+
 from countries import ACLED_NAMES, resolve_country
 from airports import AFRICAN_AIRPORTS, AIRPORTS_BY_COUNTRY, get_airport
 
@@ -47,7 +61,7 @@ async def get_token() -> str:
     global _token, _token_expiry
     if _token and time.time() < _token_expiry:
         return _token
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             ACLED_TOKEN_URL,
             data={
@@ -319,7 +333,7 @@ async def fetch_acled_events(
         params["event_type"] = event_type
 
     logging.info("Calling ACLED API: %s %s", ACLED_API_URL, params)
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.get(
             ACLED_API_URL,
             params=params,
@@ -359,7 +373,7 @@ async def run_africa_report(
 
     token = await get_token()
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         tasks = [
             _fetch_country(client, token, country, date_from_str, date_to_str)
             for country in ACLED_NAMES
@@ -514,7 +528,7 @@ async def fetch_airport_activity(
     end_ts = int(time.time())
     begin_ts = end_ts - (days_back * 86400)
 
-    async with httpx.AsyncClient(timeout=180) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
 
     summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
@@ -540,7 +554,7 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     end_ts = int(time.time())
     begin_ts = end_ts - (3 * 86400)
 
-    async with httpx.AsyncClient(timeout=180) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         tasks = [
             _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
             for airport in AFRICAN_AIRPORTS
