@@ -9,6 +9,8 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+from countries import ACLED_NAMES, resolve_country
+
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
@@ -16,19 +18,6 @@ ACLED_API_URL = "https://acleddata.com/api/acled/read"
 ACLED_TOKEN_URL = "https://acleddata.com/oauth/token"
 ACLED_USERNAME = os.getenv("ACLED_USERNAME", "")
 ACLED_PASSWORD = os.getenv("ACLED_PASSWORD", "")
-
-AFRICAN_COUNTRIES = [
-    "Algeria", "Angola", "Benin", "Botswana", "Burkina Faso", "Burundi",
-    "Cabo Verde", "Cameroon", "Central African Republic", "Chad", "Comoros",
-    "Democratic Republic of the Congo", "Djibouti", "Egypt", "Equatorial Guinea",
-    "Eritrea", "Eswatini", "Ethiopia", "Gabon", "Gambia", "Ghana", "Guinea",
-    "Guinea-Bissau", "Ivory Coast", "Kenya", "Lesotho", "Liberia", "Libya",
-    "Madagascar", "Malawi", "Mali", "Mauritania", "Mauritius", "Morocco",
-    "Mozambique", "Namibia", "Niger", "Nigeria", "Republic of the Congo",
-    "Rwanda", "Sao Tome and Principe", "Senegal", "Seychelles", "Sierra Leone",
-    "Somalia", "South Africa", "South Sudan", "Sudan", "Tanzania", "Togo",
-    "Tunisia", "Uganda", "Zambia", "Zimbabwe",
-]
 
 DIPLOMATIC_KEYWORDS = [
     "embassy", "embassies", "consulate", "consular", "diplomatic",
@@ -312,8 +301,11 @@ async def fetch_acled_events(
         limit: Maximum number of records to return (default 5000).
     """
     token = await get_token()
+    canonical = resolve_country(country)
+    if canonical is None:
+        return {"error": f"Unrecognised country: '{country}'. Check spelling or use an ISO code."}
     params: dict[str, str | int] = {
-        "country": country,
+        "country": canonical,
         "event_date": f"{date_from}|{date_to}",
         "event_date_where": "BETWEEN",
         "limit": limit,
@@ -365,11 +357,11 @@ async def run_africa_report(
     async with httpx.AsyncClient(timeout=60) as client:
         tasks = [
             _fetch_country(client, token, country, date_from_str, date_to_str)
-            for country in AFRICAN_COUNTRIES
+            for country in ACLED_NAMES
         ]
         results = await asyncio.gather(*tasks)
 
-    country_events: dict[str, list[dict]] = dict(zip(AFRICAN_COUNTRIES, results))
+    country_events: dict[str, list[dict]] = dict(zip(ACLED_NAMES, results))
 
     report: dict[str, dict] = {}
 
