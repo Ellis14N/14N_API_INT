@@ -535,7 +535,7 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     to the second half.
 
     Args:
-        reduction_threshold_pct: Minimum % reduction in flights to include an airport (default 10.0).
+        reduction_threshold_pct: Minimum % reduction in flights to include an airport (default 25.0).
     """
     end_ts = int(time.time())
     begin_ts = end_ts - (3 * 86400)
