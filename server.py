@@ -591,5 +591,64 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic tool
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def test_connectivity() -> dict:
+    """Test outbound connectivity to ACLED and OpenSky APIs.
+
+    Returns status codes, errors, and credential presence for debugging.
+    """
+    results: dict[str, object] = {
+        "acled_username_set": bool(ACLED_USERNAME),
+        "acled_password_set": bool(ACLED_PASSWORD),
+        "opensky_username_set": bool(OPENSKY_USERNAME),
+        "opensky_password_set": bool(OPENSKY_PASSWORD),
+    }
+
+    # Test ACLED token endpoint
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                ACLED_TOKEN_URL,
+                data={
+                    "username": ACLED_USERNAME,
+                    "password": ACLED_PASSWORD,
+                    "grant_type": "password",
+                    "client_id": "acled",
+                },
+            )
+            results["acled_token_status"] = resp.status_code
+            results["acled_token_body"] = resp.text[:500]
+    except Exception as exc:
+        results["acled_token_error"] = str(exc)
+
+    # Test OpenSky endpoint (simple departures query)
+    try:
+        now = int(time.time())
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{OPENSKY_API_URL}/flights/departure",
+                params={"airport": "HKJK", "begin": now - 7200, "end": now},
+                auth=(OPENSKY_USERNAME, OPENSKY_PASSWORD) if OPENSKY_USERNAME else None,
+            )
+            results["opensky_status"] = resp.status_code
+            results["opensky_body"] = resp.text[:500]
+    except Exception as exc:
+        results["opensky_error"] = str(exc)
+
+    # Test basic DNS / outbound connectivity
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://httpbin.org/ip")
+            results["outbound_ip"] = resp.json().get("origin", "unknown")
+    except Exception as exc:
+        results["outbound_error"] = str(exc)
+
+    return results
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
