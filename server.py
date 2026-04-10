@@ -527,7 +527,7 @@ async def fetch_airport_activity(
 
 
 @mcp.tool()
-async def run_opensky_report(reduction_threshold_pct: float = 10.0) -> dict:
+async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     """Run OpenSky Data across all major African airports over the past 3 days.
 
     Returns airports that have experienced a reduction in air traffic of at least
