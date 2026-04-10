@@ -1,9 +1,12 @@
+import logging
 import os
 import time
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
@@ -72,12 +75,16 @@ async def fetch_acled_events(
     if event_type:
         params["event_type"] = event_type
 
+    logging.info("Calling ACLED API: %s %s", ACLED_API_URL, params)
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.get(
             ACLED_API_URL,
             params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
+        logging.info("ACLED response status: %s", resp.status_code)
+        if resp.status_code != 200:
+            logging.error("ACLED error body: %s", resp.text)
         resp.raise_for_status()
         return resp.json()
 
