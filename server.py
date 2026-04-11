@@ -589,7 +589,7 @@ async def fetch_airport_activity(
             if ctx:
                 await ctx.report_progress(chunk_count[0], total_chunks, f"Fetching {icao} chunk {chunk_count[0]}/{total_chunks}")
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
 
         if ctx:
