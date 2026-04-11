@@ -454,27 +454,40 @@ async def _fetch_opensky_airport(
     begin: int,
     end: int,
 ) -> dict:
-    """Fetch departures and arrivals for one airport from OpenSky."""
+    """Fetch departures and arrivals for one airport from OpenSky.
+
+    OpenSky limits each query to a 2-hour window, so we split the range
+    into 2-hour chunks and aggregate.
+    """
     auth = (OPENSKY_USERNAME, OPENSKY_PASSWORD)
     results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
+    CHUNK = 7200  # 2 hours in seconds
 
     try:
-        dep = await client.get(
-            f"{OPENSKY_API_URL}/flights/departure",
-            params={"airport": icao, "begin": begin, "end": end},
-            auth=auth,
-        )
-        arr = await client.get(
-            f"{OPENSKY_API_URL}/flights/arrival",
-            params={"airport": icao, "begin": begin, "end": end},
-            auth=auth,
-        )
-        results["departures"] = dep.json() if dep.status_code == 200 else []
-        results["arrivals"] = arr.json() if arr.status_code == 200 else []
-        if dep.status_code not in (200, 404):
-            logging.warning("OpenSky %s departure: %s", icao, dep.status_code)
-        if arr.status_code not in (200, 404):
-            logging.warning("OpenSky %s arrival: %s", icao, arr.status_code)
+        t = begin
+        while t < end:
+            chunk_end = min(t + CHUNK, end)
+            dep = await client.get(
+                f"{OPENSKY_API_URL}/flights/departure",
+                params={"airport": icao, "begin": t, "end": chunk_end},
+                auth=auth,
+            )
+            if dep.status_code == 200:
+                results["departures"].extend(dep.json() or [])
+            elif dep.status_code not in (404,):
+                logging.warning("OpenSky %s departure: %s", icao, dep.status_code)
+
+            arr = await client.get(
+                f"{OPENSKY_API_URL}/flights/arrival",
+                params={"airport": icao, "begin": t, "end": chunk_end},
+                auth=auth,
+            )
+            if arr.status_code == 200:
+                results["arrivals"].extend(arr.json() or [])
+            elif arr.status_code not in (404,):
+                logging.warning("OpenSky %s arrival: %s", icao, arr.status_code)
+
+            t = chunk_end
     except Exception as e:
         results["error"] = str(e)
         logging.error("OpenSky fetch error for %s: %s", icao, e)
@@ -541,7 +554,7 @@ async def fetch_airport_activity(
         end_ts = int(time.time())
         begin_ts = end_ts - (_days_back * 86400)
 
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
 
         summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
@@ -573,12 +586,15 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
         end_ts = int(time.time())
         begin_ts = end_ts - (3 * 86400)
 
-        async with httpx.AsyncClient(timeout=300) as client:
-            tasks = [
-                _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
-                for airport in AFRICAN_AIRPORTS
-            ]
-            results = await asyncio.gather(*tasks)
+        sem = asyncio.Semaphore(5)  # max 5 airports concurrently to avoid rate limits
+
+        async def _fetch_with_limit(airport: dict) -> dict:
+            async with sem:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    return await _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
+
+        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
+        results = await asyncio.gather(*tasks)
 
         # Group by country, only including airports with >= threshold reduction
         country_report: dict[str, dict] = {}
