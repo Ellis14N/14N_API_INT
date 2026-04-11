@@ -456,12 +456,13 @@ async def _fetch_opensky_airport(
 ) -> dict:
     """Fetch departures and arrivals for one airport from OpenSky.
 
-    OpenSky limits each query to a 2-hour window, so we split the range
-    into 2-hour chunks and aggregate.
+    OpenSky /flights/departure and /flights/arrival endpoints allow up to
+    2-day (172 800 s) windows per request.  We split the range into 2-day
+    chunks and aggregate.
     """
     auth = (OPENSKY_USERNAME, OPENSKY_PASSWORD)
     results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
-    CHUNK = 7200  # 2 hours in seconds
+    CHUNK = 172800  # 2 days in seconds (max allowed by departure/arrival endpoints)
 
     try:
         t = begin
@@ -536,22 +537,25 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
 @mcp.tool()
 async def fetch_airport_activity(
     airport_icao: str,
-    days_back: int = 7,
+    days_back: int = 3,
 ) -> dict:
     """Fetch departures and arrivals for a specific African airport over the past N days.
 
     Args:
         airport_icao: ICAO airport code (e.g. "HKJK" for Nairobi, "FAOR" for Johannesburg).
-        days_back: Number of days to look back, max 7 (default 7).
+        days_back: Number of days to look back, max 3 (default 3).
     """
     async def _impl():
-        _days_back = min(max(days_back, 1), 7)
+        _days_back = min(max(days_back, 1), 3)
         icao = airport_icao.upper().strip()
         airport = get_airport(icao)
         if airport is None:
             return {"error": f"Airport '{icao}' not found in African airport database."}
 
-        end_ts = int(time.time())
+        # End at start of today UTC — OpenSky batches data overnight
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc)
+        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         begin_ts = end_ts - (_days_back * 86400)
 
         async with httpx.AsyncClient(timeout=60) as client:
@@ -576,14 +580,17 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
     """Run OpenSky Data across all major African airports over the past 3 days.
 
     Returns airports that have experienced a reduction in air traffic of at least
-    reduction_threshold_pct% (default 4%), comparing the first half of the window
+    reduction_threshold_pct% (default 25%), comparing the first half of the window
     to the second half.
 
     Args:
         reduction_threshold_pct: Minimum % reduction in flights to include an airport (default 25.0).
     """
     async def _impl():
-        end_ts = int(time.time())
+        # End at start of today UTC — OpenSky batches data overnight
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc)
+        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         begin_ts = end_ts - (3 * 86400)
 
         sem = asyncio.Semaphore(5)  # max 5 airports concurrently to avoid rate limits
