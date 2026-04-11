@@ -7,7 +7,7 @@ from datetime import date, timedelta
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 # ---------------------------------------------------------------------------
 # Timeout configuration
@@ -356,6 +356,7 @@ async def fetch_acled_events(
 async def run_africa_report(
     facility_lat: float | None = None,
     facility_lon: float | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Run the ACLED Daily Africa Report across all 54 African countries.
 
@@ -378,7 +379,13 @@ async def run_africa_report(
         if facility_lat is not None and facility_lon is not None:
             facility_coords = (facility_lat, facility_lon)
 
+        if ctx:
+            await ctx.report_progress(0, 54, "Authenticating with ACLED...")
+
         token = await get_token()
+
+        if ctx:
+            await ctx.report_progress(1, 54, "Fetching data for 54 countries...")
 
         async with httpx.AsyncClient(timeout=180) as client:
             tasks = [
@@ -386,6 +393,9 @@ async def run_africa_report(
                 for country in ACLED_NAMES
             ]
             results = await asyncio.gather(*tasks)
+
+        if ctx:
+            await ctx.report_progress(50, 54, "Analysing triggers...")
 
         country_events: dict[str, list[dict]] = dict(zip(ACLED_NAMES, results))
 
@@ -430,6 +440,9 @@ async def run_africa_report(
                     "alerts": alerts,
                 }
 
+        if ctx:
+            await ctx.report_progress(54, 54, "Report complete.")
+
         return {
             "report_date": date_to_str,
             "period": f"{date_from_str} to {date_to_str}",
@@ -453,12 +466,15 @@ async def _fetch_opensky_airport(
     icao: str,
     begin: int,
     end: int,
+    on_chunk_done: object = None,
 ) -> dict:
     """Fetch departures and arrivals for one airport from OpenSky.
 
     OpenSky /flights/departure and /flights/arrival endpoints allow up to
     2-day (172 800 s) windows per request.  We split the range into 2-day
     chunks and aggregate.
+
+    on_chunk_done: optional async callable invoked after each chunk for progress pings.
     """
     auth = (OPENSKY_USERNAME, OPENSKY_PASSWORD)
     results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
@@ -489,6 +505,9 @@ async def _fetch_opensky_airport(
                 logging.warning("OpenSky %s arrival: %s", icao, arr.status_code)
 
             t = chunk_end
+
+            if on_chunk_done:
+                await on_chunk_done()
     except Exception as e:
         results["error"] = str(e)
         logging.error("OpenSky fetch error for %s: %s", icao, e)
@@ -538,6 +557,7 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
 async def fetch_airport_activity(
     airport_icao: str,
     days_back: int = 3,
+    ctx: Context | None = None,
 ) -> dict:
     """Fetch departures and arrivals for a specific African airport over the past N days.
 
@@ -552,14 +572,28 @@ async def fetch_airport_activity(
         if airport is None:
             return {"error": f"Airport '{icao}' not found in African airport database."}
 
+        if ctx:
+            await ctx.report_progress(0, 3, f"Querying OpenSky for {icao}...")
+
         # End at start of today UTC — OpenSky batches data overnight
         from datetime import datetime, timezone
         now_utc = datetime.now(timezone.utc)
         end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         begin_ts = end_ts - (_days_back * 86400)
 
+        chunk_count = [0]
+        total_chunks = max(1, math.ceil((_days_back * 86400) / 172800))
+
+        async def _ping():
+            chunk_count[0] += 1
+            if ctx:
+                await ctx.report_progress(chunk_count[0], total_chunks, f"Fetching {icao} chunk {chunk_count[0]}/{total_chunks}")
+
         async with httpx.AsyncClient(timeout=60) as client:
-            result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts)
+            result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
+
+        if ctx:
+            await ctx.report_progress(3, 3, "Summarising results...")
 
         summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
         return {
@@ -576,7 +610,10 @@ async def fetch_airport_activity(
 
 
 @mcp.tool()
-async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
+async def run_opensky_report(
+    reduction_threshold_pct: float = 25.0,
+    ctx: Context | None = None,
+) -> dict:
     """Run OpenSky Data across all major African airports over the past 3 days.
 
     Returns airports that have experienced a reduction in air traffic of at least
@@ -593,12 +630,21 @@ async def run_opensky_report(reduction_threshold_pct: float = 25.0) -> dict:
         end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         begin_ts = end_ts - (3 * 86400)
 
+        total_airports = len(AFRICAN_AIRPORTS)
+        completed = [0]  # mutable counter for closure
         sem = asyncio.Semaphore(5)  # max 5 airports concurrently to avoid rate limits
 
         async def _fetch_with_limit(airport: dict) -> dict:
             async with sem:
                 async with httpx.AsyncClient(timeout=60) as client:
-                    return await _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
+                    result = await _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
+                completed[0] += 1
+                if ctx:
+                    await ctx.report_progress(
+                        completed[0], total_airports,
+                        f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
+                    )
+                return result
 
         tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
         results = await asyncio.gather(*tasks)
