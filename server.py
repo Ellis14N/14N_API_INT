@@ -345,15 +345,21 @@ async def run_africa_report(
         facility_lat: Optional latitude of an operating facility for Trigger 2 checks.
         facility_lon: Optional longitude of an operating facility for Trigger 2 checks.
     """
+    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+    cache_file = cache_dir / f"acled_conflicts_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
+
     if facility_lat is None and facility_lon is None:
-        cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
-        cache_file = cache_dir / f"acled_conflicts_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
         if cache_file.exists():
             try:
                 with open(cache_file) as f:
                     return json.load(f)["data"]
             except Exception as e:
                 logging.warning("ACLED cache read failed: %s", e)
+        else:
+            return {
+                "error": "Data not yet available",
+                "message": "ACLED data is refreshed daily at 03:00 UTC. Please try again after the cache has been populated, or run the cron job manually.",
+            }
 
     async def _impl():
         date_to = date.today()
