@@ -618,10 +618,11 @@ async def run_unhcr_report() -> dict:
         resp.raise_for_status()
         data = resp.json()["data"]
 
-        # Sort countries by absolute YoY % change (largest movers first)
+        # Sort by absolute numerical change (people displaced) — balances % with scale
+        # A country gaining 78 people at +118% ranks far below one losing 1.4M at -11%
         def _sort_key(item):
-            pct = (item[1].get("inflow", {}).get("trend", {}).get("change_pct") or 0)
-            return abs(pct)
+            change = (item[1].get("inflow", {}).get("trend", {}).get("change") or 0)
+            return abs(change)
 
         data["countries"] = dict(
             sorted(data["countries"].items(), key=_sort_key, reverse=True)
