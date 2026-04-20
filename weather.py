@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
@@ -130,6 +130,21 @@ CAMS_AFRICA_ZONES: list[dict] = [
     {"name": "Madagascar", "lat": -19.0, "lon": 47.0},
     {"name": "Ethiopia Highlands", "lat": 9.0, "lon": 39.0},
 ]
+
+CAMS_ZONE_COUNTRIES: dict[str, list[str]] = {
+    "Sahara / Sahel Dust Belt": ["Mali", "Niger", "Chad", "Sudan", "Mauritania", "Algeria", "Libya", "Burkina Faso"],
+    "West Africa Coast (Dakar–Accra)": ["Senegal", "Guinea-Bissau", "Guinea", "Sierra Leone", "Liberia", "Ivory Coast", "Ghana"],
+    "Gulf of Guinea / Nigeria Delta": ["Nigeria", "Benin", "Togo", "Cameroon", "Equatorial Guinea", "Gabon"],
+    "Congo Basin": ["Democratic Republic of the Congo", "Republic of the Congo", "Central African Republic", "Gabon"],
+    "East African Rift (Kenya–Tanzania)": ["Kenya", "Tanzania", "Uganda", "Rwanda", "Burundi"],
+    "Horn of Africa": ["Somalia", "Ethiopia", "Djibouti", "Eritrea"],
+    "Southern Africa (Zimbabwe–Mozambique)": ["Zimbabwe", "Mozambique", "Malawi", "Zambia"],
+    "Cape / South Africa": ["South Africa", "Lesotho", "Eswatini", "Namibia", "Botswana"],
+    "North Africa Coast (Morocco–Egypt)": ["Morocco", "Algeria", "Tunisia", "Libya", "Egypt"],
+    "Nile Delta / Egypt": ["Egypt", "Sudan"],
+    "Madagascar": ["Madagascar"],
+    "Ethiopia Highlands": ["Ethiopia"],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -655,21 +670,28 @@ async def fetch_cams_africa(client: httpx.AsyncClient) -> dict:
 # ---------------------------------------------------------------------------
 
 TIER_ORDER = {"Alert": 0, "Warning": 1, "Monitor": 2}
+# Statuses ordered for display
+STATUS_ORDER = {"live_new": 0, "continuing": 1, "forecasted": 2, "previous_7d": 3}
 
 
 def _tier_sort(events: list[dict]) -> list[dict]:
-    return sorted(events, key=lambda e: TIER_ORDER.get(e.get("tier", "Monitor"), 2))
+    return sorted(events, key=lambda e: (
+        TIER_ORDER.get(e.get("tier", "Monitor"), 2),
+        STATUS_ORDER.get(e.get("status", "continuing"), 1),
+    ))
 
 
 def _event(
     tier: str, status: str, event_type: str, location: str,
-    headline: str, detail: str = "", source: str = "", url: str | None = None,
+    headline: str, detail: str = "", source: str = "",
+    url: str | None = None, countries_impacted: list[str] | None = None,
 ) -> dict:
     return {
         "tier": tier,
         "status": status,
         "event_type": event_type,
         "location": location,
+        "countries_impacted": [c for c in (countries_impacted or []) if c],
         "headline": headline,
         "detail": detail,
         "source": source,
@@ -677,9 +699,41 @@ def _event(
     }
 
 
+def _parse_date(s: str | None) -> date | None:
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d %b %Y", "%d-%b-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s[:len(fmt)], fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _gdacs_status(from_str: str | None, to_str: str | None, today: date) -> str | None:
+    """Return event status or None to exclude (>7 days old)."""
+    from_d = _parse_date(from_str)
+    to_d = _parse_date(to_str)
+    if from_d is None:
+        return "live_new"
+    days_old = (today - from_d).days
+    if days_old > 7:
+        return None  # too old, exclude
+    if days_old <= 1:
+        return "live_new"
+    # 2-7 days old: check if ended
+    if to_d and to_d < today:
+        return "previous_7d"
+    return "continuing"
+
+
 def _events_from_gdacs(data: dict) -> list[dict]:
+    today = date.today()
     events = []
     for e in data.get("events", []):
+        status = _gdacs_status(e.get("from_date"), e.get("to_date"), today)
+        if status is None:
+            continue
         alert = (e.get("alert_level") or "Green").capitalize()
         if alert == "Red":
             tier = "Alert"
@@ -688,16 +742,17 @@ def _events_from_gdacs(data: dict) -> list[dict]:
         else:
             tier = "Monitor"
         etype = e.get("event_type", "Unknown")
-        country = e.get("country", "Unknown")
+        country = e.get("country") or "Unknown"
         severity = (e.get("severity") or "").strip()
         pop = e.get("population_affected") or ""
         detail = severity
         if pop:
             detail += f" Population affected: {pop}"
         events.append(_event(
-            tier=tier, status="current",
+            tier=tier, status=status,
             event_type=etype,
             location=country,
+            countries_impacted=[country],
             headline=f"{alert} {etype} — {country}",
             detail=detail.strip(),
             source="GDACS",
@@ -719,9 +774,10 @@ def _events_from_rsmc(data: dict) -> list[dict]:
     if movement:
         detail += f" Movement: {movement}."
     return [_event(
-        tier=tier, status="current",
+        tier=tier, status="live_new",
         event_type="Tropical Cyclone",
         location="Indian Ocean / East Africa",
+        countries_impacted=["Madagascar", "Mozambique", "Tanzania", "Kenya", "Comoros"],
         headline=f"{system} — {severity} severity",
         detail=detail,
         source="RSMC La Réunion",
@@ -747,6 +803,7 @@ def _events_from_glofas(data: dict) -> list[dict]:
             tier=tier, status="forecasted",
             event_type="Flood",
             location=c["country"],
+            countries_impacted=[c["country"]],
             headline=f"{risk} flood risk — {c['country']} (14-day forecast)",
             detail=". ".join(parts),
             source="GloFAS / Open-Meteo",
@@ -795,11 +852,13 @@ def _events_from_cams(data: dict) -> list[dict]:
         if signals:
             parts.append(f"Signals: {', '.join(signals)}")
 
+        zone_name = z["zone"]
         events.append(_event(
             tier=tier, status="forecasted",
             event_type=etype,
-            location=z["zone"],
-            headline=f"{risk} air quality — {z['zone']} (3-day forecast)",
+            location=zone_name,
+            countries_impacted=CAMS_ZONE_COUNTRIES.get(zone_name, []),
+            headline=f"{risk} air quality — {zone_name} (3-day forecast)",
             detail=". ".join(parts),
             source="CAMS / Open-Meteo",
         ))
@@ -834,6 +893,7 @@ def _events_from_acmad(data: dict) -> list[dict]:
             tier=tier, status="forecasted",
             event_type=etype,
             location="Africa (pan-continental)",
+            countries_impacted=[],
             headline=f"ACMAD {period}: {line[:80]}",
             detail=line,
             source="RCC ACMAD Decadal",
@@ -852,6 +912,8 @@ def _events_from_acmad(data: dict) -> list[dict]:
 def _events_from_fao_diem(data: dict) -> list[dict]:
     if not data.get("available"):
         return []
+    today = date.today()
+    cutoff = today - timedelta(days=7)
     flood_kw = ["flood", "flooding", "cyclone", "storm", "heavy rain", "inundation"]
     drought_kw = ["drought", "dry spell", "below-average rainfall", "water stress", "erratic rain"]
     events = []
@@ -859,19 +921,31 @@ def _events_from_fao_diem(data: dict) -> list[dict]:
         shocks = (rec.get("shocks_highlights") or "").lower()
         if not shocks:
             continue
+
+        # Respect 7-day window using FAO DIEM validation date
+        val_d = _parse_date(rec.get("validation_date"))
+        if val_d and val_d < cutoff:
+            continue
+
         if any(k in shocks for k in flood_kw):
             etype = "Flood / Storm"
         elif any(k in shocks for k in drought_kw):
             etype = "Drought"
         else:
             continue
+
         country = rec.get("country") or iso
         val_date = rec.get("validation_date") or ""
         snippet = (rec.get("shocks_highlights") or "")[:200]
+
+        # Classify as live_new (validated today/yesterday) or continuing
+        status = "live_new" if val_d and (today - val_d).days <= 1 else "continuing"
+
         events.append(_event(
-            tier="Monitor", status="current",
+            tier="Monitor", status=status,
             event_type=etype,
             location=country,
+            countries_impacted=[country],
             headline=f"{etype} conditions — {country}" + (f" ({val_date})" if val_date else ""),
             detail=snippet,
             source="FAO DIEM",
@@ -888,9 +962,14 @@ async def fetch_weather_africa_report() -> dict:
     """
     Fetch all 8 sources concurrently and return a structured daily intelligence report.
 
-    Output shape:
-        report_date, fetched_at, summary{alert/warning/monitor counts},
-        current[events], forecasted[events], source_metadata
+    Events are bucketed into four statuses:
+        live_new     — active event detected/started within the last 24 hours
+        continuing   — active event started 2–7 days ago and still ongoing
+        forecasted   — future event within the forecast window (3–14 days)
+        previous_7d  — event that ended within the last 7 days
+
+    Events older than 7 days are excluded. If no events qualify, the report
+    reflects that cleanly with empty buckets and has_events: false.
     """
     timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0)
 
@@ -924,24 +1003,36 @@ async def fetch_weather_africa_report() -> dict:
     all_events.extend(_events_from_acmad(src.get("acmad_decadal", {})))
     all_events.extend(_events_from_fao_diem(src.get("fao_diem", {})))
 
-    current = _tier_sort([e for e in all_events if e["status"] == "current"])
-    forecasted = _tier_sort([e for e in all_events if e["status"] == "forecasted"])
+    def _bucket(status: str) -> list[dict]:
+        return _tier_sort([e for e in all_events if e["status"] == status])
 
     def _count(tier: str) -> int:
         return sum(1 for e in all_events if e["tier"] == tier)
 
+    live_new = _bucket("live_new")
+    continuing = _bucket("continuing")
+    forecasted = _bucket("forecasted")
+    previous_7d = _bucket("previous_7d")
+
+    has_events = bool(live_new or continuing or forecasted or previous_7d)
+
     return {
         "report_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "fetched_at": _now_iso(),
+        "has_events": has_events,
         "summary": {
             "alert": _count("Alert"),
             "warning": _count("Warning"),
             "monitor": _count("Monitor"),
-            "current_events": len(current),
-            "forecasted_events": len(forecasted),
+            "live_new": len(live_new),
+            "continuing": len(continuing),
+            "forecasted": len(forecasted),
+            "previous_7d": len(previous_7d),
         },
-        "current": current,
+        "live_new": live_new,
+        "continuing": continuing,
         "forecasted": forecasted,
+        "previous_7d": previous_7d,
         "source_metadata": {
             "gdacs_total_active": src.get("gdacs", {}).get("total_active"),
             "glofas_high_risk_countries": src.get("glofas", {}).get("high_risk_count"),
