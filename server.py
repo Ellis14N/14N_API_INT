@@ -25,6 +25,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from countries import ACLED_NAMES, resolve_country
 from airports import AFRICAN_AIRPORTS, AIRPORTS_BY_COUNTRY, get_airport
+from icao_iata import ICAO_TO_IATA
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -37,6 +38,13 @@ ACLED_PASSWORD = os.getenv("ACLED_PASSWORD", "")
 OPENSKY_API_URL = "https://opensky-network.org/api"
 OPENSKY_USERNAME = os.getenv("OPENSKY_USERNAME", "")
 OPENSKY_PASSWORD = os.getenv("OPENSKY_PASSWORD", "")
+
+AERODATA_API_URL = "https://aerodatabox.p.rapidapi.com"
+AERODATA_API_HOST = "aerodatabox.p.rapidapi.com"
+AERODATA_API_KEY = os.getenv("AERODATA_API_KEY", "")
+
+AVIATIONSTACK_API_URL = "https://api.aviationstack.com/v1"
+AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY", "")
 
 DIPLOMATIC_KEYWORDS = [
     "embassy", "embassies", "consulate", "consular", "diplomatic",
