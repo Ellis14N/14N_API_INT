@@ -1,0 +1,65 @@
+name: Cache Severe Weather Events
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 04:00 UTC daily
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx python-dotenv
+
+      - name: Run weather cache job
+        run: python fetch_and_cache.py --task weather
+
+      - name: Push cache file to data branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          DATE=$(date -u +%d-%m-%y)
+          FILE="cache/Weather ${DATE}.json"
+
+          if [ ! -f "$FILE" ]; then
+            echo "Cache file not found: $FILE"
+            ls cache/ || true
+            exit 1
+          fi
+          echo "Committing: $FILE"
+
+          git fetch origin data:refs/remotes/origin/data 2>/dev/null || true
+
+          if git ls-remote --exit-code origin data >/dev/null 2>&1; then
+            git worktree add /tmp/data-branch data
+            git -C /tmp/data-branch pull origin data --rebase 2>/dev/null || true
+          else
+            git worktree add --orphan -b data /tmp/data-branch
+          fi
+
+          mkdir -p "/tmp/data-branch/cache"
+          cp "$FILE" "/tmp/data-branch/${FILE}"
+
+          cd /tmp/data-branch
+          git add "cache/Weather ${DATE}.json"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: severe weather cache ${DATE}"
+          git push origin data

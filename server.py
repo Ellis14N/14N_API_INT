@@ -347,6 +347,17 @@ async def run_africa_report(
     cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
     cache_file = cache_dir / f"acled_conflicts_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
 
+    async def _fetch_weather_cache() -> dict:
+        try:
+            today_label = datetime.utcnow().strftime("%d-%m-%y")
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(f"{GITHUB_RAW}/Weather {today_label}.json")
+            if resp.status_code == 200:
+                return resp.json().get("data", {})
+        except Exception as e:
+            logging.warning("Weather cache fetch failed: %s", e)
+        return {}
+
     async def _fetch_unhcr_cache() -> dict:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -362,8 +373,10 @@ async def run_africa_report(
             try:
                 with open(cache_file) as f:
                     acled_data = json.load(f)["data"]
-                unhcr_data = await _fetch_unhcr_cache()
-                return {**acled_data, "unhcr_displacement": unhcr_data}
+                unhcr_data, weather_data = await asyncio.gather(
+                    _fetch_unhcr_cache(), _fetch_weather_cache()
+                )
+                return {**acled_data, "unhcr_displacement": unhcr_data, "severe_weather": weather_data}
             except Exception as e:
                 logging.warning("ACLED cache read failed: %s", e)
         else:
@@ -433,7 +446,9 @@ async def run_africa_report(
         if ctx:
             await ctx.report_progress(54, 54, "Report complete.")
 
-        unhcr_data = await _fetch_unhcr_cache()
+        unhcr_data, weather_data = await asyncio.gather(
+            _fetch_unhcr_cache(), _fetch_weather_cache()
+        )
 
         return {
             "report_date": date_to_str,
@@ -442,6 +457,7 @@ async def run_africa_report(
             "facility_coords_used": facility_coords,
             "results": report,
             "unhcr_displacement": unhcr_data,
+            "severe_weather": weather_data,
         }
 
     try:
@@ -588,6 +604,40 @@ async def run_travel_advisories_report() -> dict:
         ),
         "all_countries_current_levels": all_countries_current,
     }
+
+
+# ---------------------------------------------------------------------------
+# Severe meteorological events
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def run_weather_report() -> dict:
+    """Run the severe meteorological and disaster events report for Africa.
+
+    Aggregates six sources:
+      - GDACS: Active multi-hazard disaster alerts (floods, cyclones, droughts, wildfires)
+      - RSMC La Réunion: Indian Ocean tropical cyclone bulletin
+      - RCC ACMAD Decadal: 10-day African climate outlook
+      - FAO DIEM: Food security and shock monitoring
+      - ICPAC Droughtwatch: Drought/rainfall dataset catalog (East Africa)
+      - ICPAC EA Hazards Watch: Hazard dataset catalog (East Africa)
+
+    Data is cached daily from public sources.
+    """
+    now_utc = datetime.utcnow()
+    today_label = now_utc.strftime("%d-%m-%y")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{GITHUB_RAW}/Weather {today_label}.json")
+        if resp.status_code == 404:
+            return {
+                "error": "Data not yet available",
+                "message": f"Weather cache for {today_label} has not been generated yet. It refreshes daily at 04:00 UTC. Trigger the workflow manually in GitHub Actions.",
+            }
+        resp.raise_for_status()
+        return resp.json()["data"]
+    except Exception as e:
+        return {"error": f"Cache fetch failed: {e}"}
 
 
 # ---------------------------------------------------------------------------

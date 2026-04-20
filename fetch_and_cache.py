@@ -259,6 +259,21 @@ async def cache_travel_advisories() -> None:
     logging.info("Wrote %s", path)
 
 
+async def cache_weather_report() -> None:
+    from weather import fetch_weather_africa_report
+    logging.info("Caching severe meteorological events report...")
+    try:
+        report = await fetch_weather_africa_report()
+    except Exception as e:
+        logging.error("Weather cache failed: %s", e)
+        return
+    date_label = datetime.utcnow().strftime("%d-%m-%y")
+    path = CACHE_DIR / f"Weather {date_label}.json"
+    with open(path, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat(), "data": report}, f)
+    logging.info("Wrote %s", path)
+
+
 async def cache_unhcr_report() -> None:
     from unhcr import fetch_unhcr_africa_report
     logging.info("Caching UNHCR displacement report for %d countries...", len(AFRICAN_CANONICAL_NAMES))
@@ -285,7 +300,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=["acled", "travel_advisories", "unhcr"])
+    parser.add_argument("--task", choices=["acled", "travel_advisories", "unhcr", "weather"])
     args = parser.parse_args()
 
     if args.task == "acled":
@@ -294,5 +309,7 @@ if __name__ == "__main__":
         asyncio.run(cache_travel_advisories())
     elif args.task == "unhcr":
         asyncio.run(cache_unhcr_report())
+    elif args.task == "weather":
+        asyncio.run(cache_weather_report())
     else:
         asyncio.run(main())
