@@ -195,9 +195,16 @@ _PROFILES: dict[str, dict] = {
     "guinea-bissau": {
         "aliases": [],
         "fcdo_slugs": ["guinea-bissau"],
-        "french_slugs": ["guinee-bissau"],
+        "french_slugs": ["guinee-bissao"],
         "dfat_names": ["Guinea-Bissau"],
         "state_dept_names": ["Guinea-Bissau"],
+    },
+    "gambia": {
+        "aliases": ["the gambia"],
+        "fcdo_slugs": ["gambia"],
+        "french_slugs": ["gambie"],
+        "dfat_names": ["Gambia", "The Gambia"],
+        "state_dept_names": ["Gambia", "The Gambia"],
     },
     "burkina faso": {
         "aliases": [],
@@ -227,6 +234,29 @@ _PROFILES: dict[str, dict] = {
         "dfat_names": ["South Sudan"],
         "state_dept_names": ["South Sudan"],
     },
+}
+
+
+_MEAE_SLUG_OVERRIDES: dict[str, list[str]] = {
+    "algeria":      ["algerie"],
+    "cameroon":     ["cameroun"],
+    "chad":         ["tchad"],
+    "comoros":      ["comores"],
+    "egypt":        ["egypte"],
+    "eritrea":      ["erythree"],
+    "ethiopia":     ["ethiopie"],
+    "guinea":       ["guinee"],
+    "libya":        ["libye"],
+    "mauritania":   ["mauritanie"],
+    "mauritius":    ["maurice"],
+    "morocco":      ["maroc"],
+    "namibia":      ["namibie"],
+    "somalia":      ["somalie"],
+    "sudan":        ["soudan"],
+    "tanzania":     ["tanzanie"],
+    "tunisia":      ["tunisie"],
+    "uganda":       ["ouganda"],
+    "zambia":       ["zambie"],
 }
 
 
@@ -304,7 +334,7 @@ async def fetch_fcdo(client: httpx.AsyncClient, country: str) -> dict:
 # US State Department (ArcGIS)
 # ---------------------------------------------------------------------------
 
-async def fetch_state_dept(client: httpx.AsyncClient, country: str) -> dict:
+async def fetch_state_dept(client: httpx.AsyncClient, country: str, cadata_map: dict | None = None) -> dict:
     profile = _resolve_profile(country)
     level_map = {
         1: "Level 1: Exercise Normal Precautions",
@@ -313,15 +343,16 @@ async def fetch_state_dept(client: httpx.AsyncClient, country: str) -> dict:
         4: "Level 4: Do Not Travel",
     }
     base = "https://gis.state.gov/arcgis/rest/services/travel/Travel/MapServer/0/query"
-    # First try the CA Data API feed for a quick, reliable match
-    try:
-        cadata_map = await _fetch_state_dept_cadata_map(client)
-        for name in profile.get("state_dept_names", []):
-            k = _normalize_name_for_lookup(name)
-            if k in cadata_map:
-                return cadata_map[k]
-    except Exception:
-        cadata_map = {}
+    # Use pre-fetched cadata_map if provided, otherwise fetch now
+    if cadata_map is None:
+        try:
+            cadata_map = await _fetch_state_dept_cadata_map(client)
+        except Exception:
+            cadata_map = {}
+    for name in profile.get("state_dept_names", []):
+        k = _normalize_name_for_lookup(name)
+        if k in cadata_map:
+            return cadata_map[k]
 
     # Fallback: try the direct travel.state.gov country page (slug-based)
     # This helps when the CA feed or ArcGIS do not include an exact match.
@@ -857,8 +888,10 @@ async def fetch_dfat(client: httpx.AsyncClient, country: str, table: dict[str, d
 
 async def fetch_meae(client: httpx.AsyncClient, country: str) -> dict:
     profile = _resolve_profile(country)
+    key = re.sub(r"\s+", " ", (country or "").lower().strip())
+    slugs = _MEAE_SLUG_OVERRIDES.get(key) or profile["french_slugs"]
     candidates = []
-    for slug in profile["french_slugs"]:
+    for slug in slugs:
         candidates += [
             f"https://www.diplomatie.gouv.fr/fr/information-par-pays/{slug}/conseils-aux-voyageurs-securite",
             f"https://www.diplomatie.gouv.fr/fr/conseils-aux-voyageurs/conseils-par-pays-destination/{slug}/",
@@ -923,12 +956,17 @@ async def fetch_all_advisories(country: str) -> dict:
 # ---------------------------------------------------------------------------
 
 async def fetch_advisories_for_countries(countries: list[str]) -> dict[str, dict]:
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        # Fetch DFAT table once
+    timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        # Fetch shared tables once to avoid hammering APIs once per country
         try:
             dfat_table = await fetch_dfat_table(client)
         except Exception:
             dfat_table = {}
+        try:
+            cadata_map = await _fetch_state_dept_cadata_map(client)
+        except Exception:
+            cadata_map = {}
 
         sem = asyncio.Semaphore(8)
 
@@ -936,7 +974,7 @@ async def fetch_advisories_for_countries(countries: list[str]) -> dict[str, dict
             async with sem:
                 fcdo, state, dfat, meae = await asyncio.gather(
                     fetch_fcdo(client, country),
-                    fetch_state_dept(client, country),
+                    fetch_state_dept(client, country, cadata_map=cadata_map),
                     fetch_dfat(client, country, table=dfat_table),
                     fetch_meae(client, country),
                     return_exceptions=True,
