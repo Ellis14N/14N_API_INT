@@ -563,6 +563,19 @@ def _get_iata_for_icao(icao: str) -> str | None:
     return code
 
 
+def _count_disruptions(flights: list) -> dict:
+    """Count cancelled and delayed flights."""
+    cancelled = 0
+    delayed = 0
+    for flight in flights:
+        status = (flight.get("status") or "").lower()
+        if "cancel" in status:
+            cancelled += 1
+        elif "delay" in status:
+            delayed += 1
+    return {"cancelled_flights": cancelled, "delayed_flights": delayed, "total_disruptions": cancelled + delayed}
+
+
 def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = None, end_ts: int | None = None) -> dict:
     """Build a summary with totals, daily time series, and trend vs first half of window."""
     from collections import defaultdict
@@ -622,6 +635,7 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
         "operating_last_24h": operating_last_24h,
         "latest_flight_date": latest_flight_date,
         "airlines": sorted(airline_codes),
+        **_count_disruptions(all_flights),
     }
 
 
@@ -1149,6 +1163,108 @@ async def run_aviationstack_report(
         return await asyncio.wait_for(_impl(), timeout=300)
     except asyncio.TimeoutError:
         return {"error": "Query timed out after 300 seconds"}
+
+
+@mcp.tool()
+async def scan_african_airports_for_disruptions(
+    provider: str = "aviationstack",
+    days_back: int = 3,
+    disruption_threshold_pct: float = 10.0,
+    sort_by: str = "disruption_pct",
+    ctx: Context | None = None,
+) -> dict:
+    """Scan all African airports for flight disruptions (cancelled or delayed flights) exceeding a threshold.
+
+    Args:
+        provider: Data provider to use ('aviationstack' or 'aerodatabox').
+        days_back: Number of days to look back (default 3).
+        disruption_threshold_pct: Minimum % of flights that must be disrupted (default 10.0).
+        sort_by: Sort results by 'disruption_pct' or 'total_disruptions' (default 'disruption_pct').
+    """
+    if provider not in ("aviationstack", "aerodatabox"):
+        return {"error": f"Unsupported provider: {provider}. Use 'aviationstack' or 'aerodatabox'."}
+
+    if provider == "aviationstack" and not AVIATIONSTACK_API_KEY:
+        return {"error": "AVIATIONSTACK_API_KEY is not configured."}
+    if provider == "aerodatabox" and not AERODATA_API_KEY:
+        return {"error": "AERODATA_API_KEY is not configured."}
+
+    async def _impl():
+        _days_back = min(max(days_back, 1), 3)
+        now_utc = datetime.now(timezone.utc)
+        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        begin_ts = end_ts - (_days_back * 86400)
+
+        total_airports = len(AFRICAN_AIRPORTS)
+        completed = [0]
+        sem = asyncio.Semaphore(2 if provider == "aviationstack" else 3)
+
+        disrupted_airports = []
+
+        async def _fetch_with_limit(airport: dict) -> None:
+            async with sem:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    if provider == "aviationstack":
+                        result = await _fetch_aviationstack_airport(client, airport["icao"], begin_ts, end_ts)
+                    else:
+                        result = await _fetch_aerodatabox_airport(client, airport["icao"], begin_ts, end_ts)
+
+                completed[0] += 1
+                if ctx:
+                    await ctx.report_progress(
+                        completed[0], total_airports,
+                        f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
+                    )
+
+                if result["error"]:
+                    return
+
+                all_flights = result["departures"] + result["arrivals"]
+                if not all_flights:
+                    return
+
+                disruptions = _count_disruptions(all_flights)
+                summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+                total_flights = summary["total_flights"]
+                if total_flights > 0:
+                    disruption_pct = round((disruptions["total_disruptions"] / total_flights) * 100, 1)
+                    if disruption_pct >= disruption_threshold_pct:
+                        disrupted_airports.append({
+                            "icao": airport["icao"],
+                            "name": airport["name"],
+                            "city": airport["city"],
+                            "country": airport["country"],
+                            "disruption_pct": disruption_pct,
+                            **summary,
+                            **disruptions,
+                        })
+
+        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
+        await asyncio.gather(*tasks)
+
+        # Sort results
+        if sort_by == "total_disruptions":
+            disrupted_airports.sort(key=lambda x: x["total_disruptions"], reverse=True)
+        elif sort_by == "disruption_pct":
+            disrupted_airports.sort(key=lambda x: x["disruption_pct"], reverse=True)
+        else:
+            disrupted_airports.sort(key=lambda x: x["disruption_pct"], reverse=True)  # default
+
+        return {
+            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "period": f"past {_days_back} days",
+            "provider": provider,
+            "disruption_threshold_pct": disruption_threshold_pct,
+            "sort_by": sort_by,
+            "airports_scanned": total_airports,
+            "airports_with_disruptions": len(disrupted_airports),
+            "disruptions": disrupted_airports,
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=600)  # Longer timeout for full scan
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 600 seconds"}
 
 
 # ---------------------------------------------------------------------------
