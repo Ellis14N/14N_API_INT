@@ -36,28 +36,30 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          FILE=$(ls "cache/Travel Advisory "*.json 2>/dev/null | head -1)
-          if [ -z "$FILE" ]; then
-            echo "No cache file produced — aborting"
+          DATE=$(date -u +%d-%m-%y)
+          FILE="cache/Travel Advisory ${DATE}.json"
+
+          if [ ! -f "$FILE" ]; then
+            echo "Cache file not found: $FILE"
+            ls cache/ || true
             exit 1
           fi
           echo "Committing: $FILE"
 
-          # Fetch data branch; initialise it if it doesn't exist yet
           git fetch origin data:refs/remotes/origin/data 2>/dev/null || true
 
-          # Create an isolated worktree on the data branch
           if git ls-remote --exit-code origin data >/dev/null 2>&1; then
             git worktree add /tmp/data-branch data
-            git -C /tmp/data-branch pull origin data
+            git -C /tmp/data-branch pull origin data --rebase 2>/dev/null || true
           else
             git worktree add --orphan -b data /tmp/data-branch
           fi
 
-          mkdir -p /tmp/data-branch/cache
-          cp "$FILE" "/tmp/data-branch/$FILE"
+          mkdir -p "/tmp/data-branch/cache"
+          cp "$FILE" "/tmp/data-branch/${FILE}"
 
-          git -C /tmp/data-branch add "cache/Travel Advisory "*.json
-          git -C /tmp/data-branch diff --cached --quiet && echo "No changes" && exit 0
-          git -C /tmp/data-branch commit -m "chore: travel advisory cache $(date -u +%d-%m-%y)"
-          git -C /tmp/data-branch push origin data
+          cd /tmp/data-branch
+          git add "cache/Travel Advisory ${DATE}.json"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: travel advisory cache ${DATE}"
+          git push origin data

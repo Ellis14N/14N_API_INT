@@ -256,14 +256,6 @@ async def cache_travel_advisories() -> None:
     with open(path, "w") as f:
         json.dump({"timestamp": datetime.utcnow().isoformat(), "data": advisories}, f)
     logging.info("Wrote %s", path)
-    # Also write a 'latest' copy for quick access
-    latest_path = CACHE_DIR / "travel_advisories_latest.json"
-    try:
-        with open(latest_path, "w") as f:
-            json.dump({"timestamp": datetime.utcnow().isoformat(), "data": advisories}, f)
-        logging.info("Wrote latest travel advisories cache: %s", latest_path)
-    except Exception as e:
-        logging.error("Failed to write latest travel advisories cache: %s", e)
 
 
 async def main() -> None:
