@@ -347,11 +347,23 @@ async def run_africa_report(
     cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
     cache_file = cache_dir / f"acled_conflicts_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
 
+    async def _fetch_unhcr_cache() -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(f"{GITHUB_RAW}/UNHCR Latest.json")
+            if resp.status_code == 200:
+                return resp.json().get("data", {})
+        except Exception as e:
+            logging.warning("UNHCR cache fetch failed: %s", e)
+        return {}
+
     if facility_lat is None and facility_lon is None:
         if cache_file.exists():
             try:
                 with open(cache_file) as f:
-                    return json.load(f)["data"]
+                    acled_data = json.load(f)["data"]
+                unhcr_data = await _fetch_unhcr_cache()
+                return {**acled_data, "unhcr_displacement": unhcr_data}
             except Exception as e:
                 logging.warning("ACLED cache read failed: %s", e)
         else:
@@ -421,12 +433,15 @@ async def run_africa_report(
         if ctx:
             await ctx.report_progress(54, 54, "Report complete.")
 
+        unhcr_data = await _fetch_unhcr_cache()
+
         return {
             "report_date": date_to_str,
             "period": f"{date_from_str} to {date_to_str}",
             "countries_with_alerts": len(report),
             "facility_coords_used": facility_coords,
             "results": report,
+            "unhcr_displacement": unhcr_data,
         }
 
     try:
@@ -573,6 +588,37 @@ async def run_travel_advisories_report() -> dict:
         ),
         "all_countries_current_levels": all_countries_current,
     }
+
+
+# ---------------------------------------------------------------------------
+# UNHCR displacement
+# ---------------------------------------------------------------------------
+
+GITHUB_RAW = "https://raw.githubusercontent.com/Ellis14N/14N_API_INT/data/cache"
+
+
+@mcp.tool()
+async def run_unhcr_report() -> dict:
+    """Run the UNHCR displacement report for all 54 African countries.
+
+    Returns total displaced persons, year-on-year trend, and the top 5 inflow
+    origins (countries sending people in) and top 5 outflow destinations
+    (countries receiving people displaced from this country) for each country.
+
+    Data is cached weekly from the UNHCR Population Statistics API.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{GITHUB_RAW}/UNHCR Latest.json")
+        if resp.status_code == 404:
+            return {
+                "error": "Data not yet available",
+                "message": "UNHCR cache has not been generated yet. Trigger the 'Cache UNHCR Displacement Data' workflow manually in GitHub Actions.",
+            }
+        resp.raise_for_status()
+        return resp.json()["data"]
+    except Exception as e:
+        return {"error": f"Cache fetch failed: {e}"}
 
 
 # ---------------------------------------------------------------------------

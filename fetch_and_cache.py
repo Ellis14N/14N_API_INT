@@ -9,6 +9,7 @@ Cache files written (CACHE_DIR, named by UTC date):
 
 Note: travel advisories are independent of ACLED conflict data and are cached separately.
 """
+import argparse
 import asyncio
 import json
 import logging
@@ -258,10 +259,23 @@ async def cache_travel_advisories() -> None:
     logging.info("Wrote %s", path)
 
 
+async def cache_unhcr_report() -> None:
+    from unhcr import fetch_unhcr_africa_report
+    logging.info("Caching UNHCR displacement report for %d countries...", len(AFRICAN_CANONICAL_NAMES))
+    try:
+        report = await fetch_unhcr_africa_report(AFRICAN_CANONICAL_NAMES)
+    except Exception as e:
+        logging.error("UNHCR cache failed: %s", e)
+        return
+    path = CACHE_DIR / "UNHCR Latest.json"
+    with open(path, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat(), "data": report}, f)
+    logging.info("Wrote %s", path)
+
+
 async def main() -> None:
     logging.info("Starting daily cache refresh")
     await cache_acled_report()
-    # Cache travel advisories for all DFAT-exported destinations (or ACLED_NAMES fallback)
     try:
         await cache_travel_advisories()
     except Exception as e:
@@ -270,4 +284,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=["acled", "travel_advisories", "unhcr"])
+    args = parser.parse_args()
+
+    if args.task == "acled":
+        asyncio.run(cache_acled_report())
+    elif args.task == "travel_advisories":
+        asyncio.run(cache_travel_advisories())
+    elif args.task == "unhcr":
+        asyncio.run(cache_unhcr_report())
+    else:
+        asyncio.run(main())
