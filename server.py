@@ -12,7 +12,7 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 
-from countries import ACLED_NAMES, resolve_country
+from countries import ACLED_NAMES, resolve_country, AFRICAN_CANONICAL_NAMES
 from travel_advisories import fetch_all_advisories
 
 logging.basicConfig(level=logging.INFO)
@@ -454,6 +454,8 @@ When asked about travel advisories:
    - Australian DFAT (Department of Foreign Affairs and Trade)
    - French MEAE (Ministry of Europe and Foreign Affairs)
 
+    Note: These travel advisories are independent from ACLED conflict-event data; do not conflate or combine the advisory outputs with ACLED event analyses.
+
 2. If new or elevated advisories are found, present them clearly:
    - Lead with the country and the source that issued the advisory
    - State the new level and what it means (e.g. Level 3: Reconsider Travel)
@@ -506,8 +508,9 @@ async def run_travel_advisories_report() -> dict:
     yesterday_file = cache_dir / f"travel_advisories_{yesterday_str}.json"
 
     try:
+        # Use a neutral canonical list of African country names for advisory fetches.
         today_data: dict = await asyncio.wait_for(
-            fetch_advisories_for_countries(ACLED_NAMES), timeout=120
+            fetch_advisories_for_countries(AFRICAN_CANONICAL_NAMES), timeout=120
         )
     except asyncio.TimeoutError:
         return {"error": "Live fetch timed out after 120 seconds"}

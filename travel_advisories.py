@@ -1,7 +1,9 @@
 """
 Travel advisory fetchers — UK FCDO, US State Department, Australian DFAT, French MEAE.
 
-Server-side Python port of the JS parsers in acled-fetcher-main/docs/index.html.
+Independent travel advisory parsers and normalizers. These functions fetch and
+normalize government travel advisories and are explicitly independent from any
+ACLED conflict-event data or ACLED-specific processing.
 Direct HTTP requests are used (no CORS proxies needed server-side).
 """
 import asyncio

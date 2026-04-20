@@ -4,9 +4,10 @@ Daily cron job: fetch data and write cache files.
 MCP tools read from these files and return instantly, staying under the 60s timeout.
 
 Cache files written (CACHE_DIR, named by UTC date):
-  acled_conflicts_YYYY-MM-DD.json — ACLED trigger report for all 54 African countries
+    acled_conflicts_YYYY-MM-DD.json — ACLED trigger report for all 54 African countries
+    travel_advisories_YYYY-MM-DD.json — Daily snapshot of travel advisories (FCDO, State Dept, DFAT, MEAE)
 
-Note: travel advisories are fetched live on demand by run_travel_advisories_report().
+Note: travel advisories are independent of ACLED conflict data and are cached separately.
 """
 import asyncio
 import json
@@ -26,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
-from countries import ACLED_NAMES
+from countries import ACLED_NAMES, AFRICAN_CANONICAL_NAMES
 import travel_advisories
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -249,10 +250,12 @@ async def cache_travel_advisories() -> None:
             if dfat_map:
                 countries = [v.get("name") or k for k, v in dfat_map.items()]
             else:
-                countries = ACLED_NAMES
+                # Fall back to a neutral canonical list of African country names
+                # (this list is independent of ACLED-specific naming).
+                countries = AFRICAN_CANONICAL_NAMES
         except Exception as e:
             logging.error("Failed to fetch DFAT export: %s", e)
-            countries = ACLED_NAMES
+            countries = AFRICAN_CANONICAL_NAMES
 
     logging.info("Fetching advisories for %d countries...", len(countries))
     try:

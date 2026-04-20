@@ -353,6 +353,11 @@ for _c in AFRICAN_COUNTRIES:
 # Ordered list of canonical ACLED names for bulk queries
 ACLED_NAMES: list[str] = [c["acled_name"] for c in AFRICAN_COUNTRIES]
 
+# Independent canonical list of African country names for non-ACLED uses
+# (e.g., travel advisory fetchers and caches). This is intentionally named
+# to avoid implying any dependency on the ACLED dataset.
+AFRICAN_CANONICAL_NAMES: list[str] = [c["acled_name"] for c in AFRICAN_COUNTRIES]
+
 
 def resolve_country(name: str) -> str | None:
     """Return the canonical ACLED country name for any input string, or None if not found."""
