@@ -905,12 +905,23 @@ async def fetch_meae(client: httpx.AsyncClient, country: str) -> dict:
             text = _html_to_text(resp.text)
 
             level, level_text = 0, "See advisory page"
-            if re.search(r"formellement\s+d[eé]conseill", text, re.IGNORECASE):
+            # Only examine text before the per-zone breakdown to avoid
+            # zone-level warnings (e.g. "Zones formellement déconseillées: [specific area]")
+            # being misread as a country-wide advisory.
+            intro = re.split(r"Zones?\s+de\s+vigilance", text, maxsplit=1, flags=re.IGNORECASE)[0]
+
+            level, level_text = 0, "See advisory page"
+            if re.search(r"formellement\s+d[eé]conseill", intro, re.IGNORECASE):
                 level, level_text = 4, "Formally advised against"
-            elif re.search(r"d[eé]conseill\S+\s+sauf\s+raison\s+imp[eé]rative", text, re.IGNORECASE):
+            elif re.search(r"d[eé]conseill\S+\s+sauf\s+raison\s+imp[eé]rative", intro, re.IGNORECASE):
                 level, level_text = 3, "Advised against except for imperative reasons"
-            elif re.search(r"vigilance\s+renforc[eé]e", text, re.IGNORECASE):
+            elif re.search(r"vigilance\s+renforc[eé]e", intro, re.IGNORECASE):
                 level, level_text = 2, "Enhanced vigilance"
+            elif re.search(r"vigilance\s+normale", intro, re.IGNORECASE):
+                level, level_text = 1, "Normal vigilance"
+
+            if level == 0:
+                continue
 
             updated_m = re.search(r"Derni[eè]re mise [aà] jour\s*:?\s*([^\-\n]{5,40})", text, re.IGNORECASE)
 
