@@ -651,16 +651,251 @@ async def fetch_cams_africa(client: httpx.AsyncClient) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Event synthesis — convert raw source data into structured tiered events
+# ---------------------------------------------------------------------------
+
+TIER_ORDER = {"Alert": 0, "Warning": 1, "Monitor": 2}
+
+
+def _tier_sort(events: list[dict]) -> list[dict]:
+    return sorted(events, key=lambda e: TIER_ORDER.get(e.get("tier", "Monitor"), 2))
+
+
+def _event(
+    tier: str, status: str, event_type: str, location: str,
+    headline: str, detail: str = "", source: str = "", url: str | None = None,
+) -> dict:
+    return {
+        "tier": tier,
+        "status": status,
+        "event_type": event_type,
+        "location": location,
+        "headline": headline,
+        "detail": detail,
+        "source": source,
+        "url": url,
+    }
+
+
+def _events_from_gdacs(data: dict) -> list[dict]:
+    events = []
+    for e in data.get("events", []):
+        alert = (e.get("alert_level") or "Green").capitalize()
+        if alert == "Red":
+            tier = "Alert"
+        elif alert == "Orange":
+            tier = "Warning"
+        else:
+            tier = "Monitor"
+        etype = e.get("event_type", "Unknown")
+        country = e.get("country", "Unknown")
+        severity = (e.get("severity") or "").strip()
+        pop = e.get("population_affected") or ""
+        detail = severity
+        if pop:
+            detail += f" Population affected: {pop}"
+        events.append(_event(
+            tier=tier, status="current",
+            event_type=etype,
+            location=country,
+            headline=f"{alert} {etype} — {country}",
+            detail=detail.strip(),
+            source="GDACS",
+            url=e.get("url"),
+        ))
+    return events
+
+
+def _events_from_rsmc(data: dict) -> list[dict]:
+    if not data.get("available"):
+        return []
+    severity = data.get("severity", "Low")
+    tier = {"High": "Alert", "Moderate": "Warning"}.get(severity, "Monitor")
+    system = data.get("system_type") or "Tropical System"
+    position = data.get("current_position") or "unknown position"
+    wind = data.get("max_wind_kt") or "unknown"
+    movement = data.get("movement") or ""
+    detail = f"Position: {position}. Max wind: {wind} kt."
+    if movement:
+        detail += f" Movement: {movement}."
+    return [_event(
+        tier=tier, status="current",
+        event_type="Tropical Cyclone",
+        location="Indian Ocean / East Africa",
+        headline=f"{system} — {severity} severity",
+        detail=detail,
+        source="RSMC La Réunion",
+        url=data.get("url"),
+    )]
+
+
+def _events_from_glofas(data: dict) -> list[dict]:
+    events = []
+    for c in data.get("countries", []):
+        risk = c.get("risk_level", "Low")
+        if risk == "Low":
+            continue
+        tier = "Alert" if risk == "High" else "Warning"
+        discharge = c.get("peak_discharge_m3s")
+        ratio = c.get("discharge_ratio")
+        parts = []
+        if discharge is not None:
+            parts.append(f"Peak discharge: {discharge} m³/s")
+        if ratio is not None:
+            parts.append(f"Ratio vs climatological mean: {ratio}x")
+        events.append(_event(
+            tier=tier, status="forecasted",
+            event_type="Flood",
+            location=c["country"],
+            headline=f"{risk} flood risk — {c['country']} (14-day forecast)",
+            detail=". ".join(parts),
+            source="GloFAS / Open-Meteo",
+        ))
+    return events
+
+
+def _events_from_cams(data: dict) -> list[dict]:
+    events = []
+    for z in data.get("zones", []):
+        if not z.get("available"):
+            continue
+        risk = z.get("risk_level", "Low")
+        signals = z.get("signals", [])
+        if risk == "Low" and not signals:
+            continue
+
+        if risk == "High":
+            tier = "Alert"
+        elif risk == "Watch":
+            tier = "Warning"
+        else:
+            tier = "Monitor"
+
+        if "saharan_dust" in signals and "harmattan" in signals:
+            etype = "Saharan Dust / Harmattan"
+        elif "harmattan" in signals:
+            etype = "Harmattan"
+        elif "saharan_dust" in signals:
+            etype = "Saharan Dust"
+        elif "wildfire_smoke" in signals:
+            etype = "Wildfire Smoke"
+        else:
+            etype = "Air Quality"
+
+        aqi = z.get("peak_aqi")
+        dust = z.get("peak_dust_ugm3")
+        pm25 = z.get("peak_pm2_5_ugm3")
+        parts = []
+        if aqi is not None:
+            parts.append(f"AQI: {aqi}")
+        if dust is not None:
+            parts.append(f"Dust: {dust} μg/m³")
+        if pm25 is not None:
+            parts.append(f"PM2.5: {pm25} μg/m³")
+        if signals:
+            parts.append(f"Signals: {', '.join(signals)}")
+
+        events.append(_event(
+            tier=tier, status="forecasted",
+            event_type=etype,
+            location=z["zone"],
+            headline=f"{risk} air quality — {z['zone']} (3-day forecast)",
+            detail=". ".join(parts),
+            source="CAMS / Open-Meteo",
+        ))
+    return events
+
+
+def _events_from_acmad(data: dict) -> list[dict]:
+    if not data.get("available"):
+        return []
+    highlights = data.get("highlights") or []
+    if not highlights:
+        return []
+
+    flood_kw = {"flood", "flooding", "excessive rainfall", "above-average", "above average", "heavy rain"}
+    drought_kw = {"drought", "below-average", "below average", "dry", "deficit", "drier"}
+    extreme_kw = {"extreme", "severe", "dangerous", "critical", "significant"}
+
+    events = []
+    for line in highlights:
+        lower = line.lower()
+        has_extreme = any(k in lower for k in extreme_kw)
+        if any(k in lower for k in flood_kw):
+            etype = "Flood / Excessive Rainfall"
+            tier = "Warning" if has_extreme else "Monitor"
+        elif any(k in lower for k in drought_kw):
+            etype = "Drought / Dry Conditions"
+            tier = "Warning" if has_extreme else "Monitor"
+        else:
+            continue
+        period = data.get("reporting_period") or "10-day outlook"
+        events.append(_event(
+            tier=tier, status="forecasted",
+            event_type=etype,
+            location="Africa (pan-continental)",
+            headline=f"ACMAD {period}: {line[:80]}",
+            detail=line,
+            source="RCC ACMAD Decadal",
+            url=data.get("pdf_url"),
+        ))
+
+    # Deduplicate — keep highest tier per event type
+    by_type: dict[str, dict] = {}
+    for e in events:
+        key = e["event_type"]
+        if key not in by_type or TIER_ORDER[e["tier"]] < TIER_ORDER[by_type[key]["tier"]]:
+            by_type[key] = e
+    return list(by_type.values())
+
+
+def _events_from_fao_diem(data: dict) -> list[dict]:
+    if not data.get("available"):
+        return []
+    flood_kw = ["flood", "flooding", "cyclone", "storm", "heavy rain", "inundation"]
+    drought_kw = ["drought", "dry spell", "below-average rainfall", "water stress", "erratic rain"]
+    events = []
+    for iso, rec in data.get("countries", {}).items():
+        shocks = (rec.get("shocks_highlights") or "").lower()
+        if not shocks:
+            continue
+        if any(k in shocks for k in flood_kw):
+            etype = "Flood / Storm"
+        elif any(k in shocks for k in drought_kw):
+            etype = "Drought"
+        else:
+            continue
+        country = rec.get("country") or iso
+        val_date = rec.get("validation_date") or ""
+        snippet = (rec.get("shocks_highlights") or "")[:200]
+        events.append(_event(
+            tier="Monitor", status="current",
+            event_type=etype,
+            location=country,
+            headline=f"{etype} conditions — {country}" + (f" ({val_date})" if val_date else ""),
+            detail=snippet,
+            source="FAO DIEM",
+            url=rec.get("brief_url"),
+        ))
+    return events
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 async def fetch_weather_africa_report() -> dict:
-    """Fetch all severe meteorological and disaster event data for Africa concurrently (8 sources)."""
+    """
+    Fetch all 8 sources concurrently and return a structured daily intelligence report.
+
+    Output shape:
+        report_date, fetched_at, summary{alert/warning/monitor counts},
+        current[events], forecasted[events], source_metadata
+    """
     timeout = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0)
 
-    # SSL verification disabled to handle ICPAC certificate issues (same as original script)
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, verify=False) as client:
-        results = await asyncio.gather(
+        raw = await asyncio.gather(
             fetch_gdacs_africa(client),
             fetch_rsmc_bulletin(client),
             fetch_acmad_decadal(client),
@@ -673,13 +908,50 @@ async def fetch_weather_africa_report() -> dict:
         )
 
     keys = ["gdacs", "rsmc_reunion", "acmad_decadal", "fao_diem", "icpac_droughtwatch", "icpac_ea_hazards", "glofas", "cams_air_quality"]
-
-    output: dict = {}
-    for key, result in zip(keys, results):
+    src: dict = {}
+    for key, result in zip(keys, raw):
         if isinstance(result, Exception):
             logging.warning("%s fetch failed: %s", key, result)
-            output[key] = {"fetched_at": _now_iso(), "available": False, "error": str(result)}
+            src[key] = {"available": False, "error": str(result)}
         else:
-            output[key] = result
+            src[key] = result
 
-    return output
+    all_events: list[dict] = []
+    all_events.extend(_events_from_gdacs(src.get("gdacs", {})))
+    all_events.extend(_events_from_rsmc(src.get("rsmc_reunion", {})))
+    all_events.extend(_events_from_glofas(src.get("glofas", {})))
+    all_events.extend(_events_from_cams(src.get("cams_air_quality", {})))
+    all_events.extend(_events_from_acmad(src.get("acmad_decadal", {})))
+    all_events.extend(_events_from_fao_diem(src.get("fao_diem", {})))
+
+    current = _tier_sort([e for e in all_events if e["status"] == "current"])
+    forecasted = _tier_sort([e for e in all_events if e["status"] == "forecasted"])
+
+    def _count(tier: str) -> int:
+        return sum(1 for e in all_events if e["tier"] == tier)
+
+    return {
+        "report_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "fetched_at": _now_iso(),
+        "summary": {
+            "alert": _count("Alert"),
+            "warning": _count("Warning"),
+            "monitor": _count("Monitor"),
+            "current_events": len(current),
+            "forecasted_events": len(forecasted),
+        },
+        "current": current,
+        "forecasted": forecasted,
+        "source_metadata": {
+            "gdacs_total_active": src.get("gdacs", {}).get("total_active"),
+            "glofas_high_risk_countries": src.get("glofas", {}).get("high_risk_count"),
+            "glofas_watch_countries": src.get("glofas", {}).get("watch_count"),
+            "cams_high_risk_zones": src.get("cams_air_quality", {}).get("high_risk_zones"),
+            "cams_watch_zones": src.get("cams_air_quality", {}).get("watch_zones"),
+            "harmattan_season": src.get("cams_air_quality", {}).get("harmattan_season"),
+            "icpac_droughtwatch_datasets": src.get("icpac_droughtwatch", {}).get("dataset_count"),
+            "icpac_ea_hazards_datasets": src.get("icpac_ea_hazards", {}).get("dataset_count"),
+            "fao_diem_countries_monitored": src.get("fao_diem", {}).get("countries_with_data"),
+            "acmad_reporting_period": src.get("acmad_decadal", {}).get("reporting_period"),
+        },
+    }
