@@ -3,7 +3,7 @@ import logging
 import math
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -540,6 +540,28 @@ def _extract_operator_from_callsign(callsign: str | None) -> str | None:
     return letters
 
 
+def _parse_datetime_to_ts(dt: str | None) -> int | None:
+    if not dt:
+        return None
+    dt = dt.strip().replace(' ', 'T')
+    if dt.endswith('Z'):
+        dt = dt[:-1] + '+00:00'
+    try:
+        return int(datetime.fromisoformat(dt).timestamp())
+    except Exception:
+        try:
+            return int(datetime.strptime(dt, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).timestamp())
+        except Exception:
+            return None
+
+
+def _get_iata_for_icao(icao: str) -> str | None:
+    code = ICAO_TO_IATA.get(icao.upper().strip())
+    if not code or code == '\\N':
+        return None
+    return code
+
+
 def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = None, end_ts: int | None = None) -> dict:
     """Build a summary with totals, daily time series, and trend vs first half of window."""
     from collections import defaultdict
@@ -552,7 +574,17 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
     operating_last_24h = False
 
     for flight in all_flights:
-        ts = flight.get("firstSeen") or flight.get("lastSeen")
+        ts = None
+        for key in ("firstSeen", "lastSeen", "scheduledTimeUtc", "actualTimeUtc", "departureTimeUtc", "arrivalTimeUtc"):
+            value = flight.get(key)
+            if isinstance(value, int):
+                ts = value
+                break
+            if isinstance(value, str):
+                ts = _parse_datetime_to_ts(value)
+                if ts is not None:
+                    break
+
         if ts:
             d = datetime.utcfromtimestamp(ts)
             key = d.strftime("%Y-%m-%d")
@@ -570,8 +602,8 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
     reduction_pct: float | None = None
     if begin_ts is not None and end_ts is not None:
         mid_ts = (begin_ts + end_ts) / 2
-        first_half = [f for f in all_flights if (f.get("firstSeen") or f.get("lastSeen") or 0) < mid_ts]
-        second_half = [f for f in all_flights if (f.get("firstSeen") or f.get("lastSeen") or 0) >= mid_ts]
+        first_half = [f for f in all_flights if ((f.get("firstSeen") or f.get("lastSeen") or 0) < mid_ts)]
+        second_half = [f for f in all_flights if ((f.get("firstSeen") or f.get("lastSeen") or 0) >= mid_ts)]
         if len(first_half) > 0:
             reduction_pct = round((len(first_half) - len(second_half)) / len(first_half) * 100, 1)
 
@@ -741,6 +773,365 @@ async def run_opensky_report(
         return {"error": "Query timed out after 300 seconds"}
 
 
+async def _fetch_aerodatabox_airport(
+    client: httpx.AsyncClient,
+    icao: str,
+    begin: int,
+    end: int,
+    on_chunk_done: object = None,
+) -> dict:
+    results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
+    chunk_size = 43200  # 12 hours max window for AeroDataBox airport flights endpoint
+    headers = {
+        "X-RapidAPI-Key": AERODATA_API_KEY,
+        "X-RapidAPI-Host": AERODATA_API_HOST,
+    }
+
+    t = begin
+    while t < end:
+        chunk_end = min(t + chunk_size, end)
+        begin_s = datetime.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M")
+        end_s = datetime.utcfromtimestamp(chunk_end).strftime("%Y-%m-%dT%H:%M")
+        try:
+            resp = await client.get(
+                f"{AERODATA_API_URL}/flights/airports/icao/{icao}/{begin_s}/{end_s}",
+                headers=headers,
+                timeout=60,
+            )
+        except Exception as e:
+            results["error"] = str(e)
+            logging.error("AeroDataBox fetch error for %s: %s", icao, e)
+            break
+
+        if resp.status_code == 200:
+            payload = resp.json() or {}
+            results["departures"].extend(payload.get("departures", []))
+            results["arrivals"].extend(payload.get("arrivals", []))
+        elif resp.status_code == 429:
+            delay = int(resp.headers.get("Retry-After", "2"))
+            await asyncio.sleep(max(delay, 1))
+            continue
+        elif resp.status_code not in (404,):
+            logging.warning("AeroDataBox %s %s -> %s", icao, begin_s, resp.status_code)
+
+        t = chunk_end
+        if on_chunk_done:
+            await on_chunk_done()
+        await asyncio.sleep(0.25)
+
+    return results
+
+
+async def _fetch_aviationstack_airport(
+    client: httpx.AsyncClient,
+    icao: str,
+    begin: int,
+    end: int,
+    on_chunk_done: object = None,
+) -> dict:
+    results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
+    iata = _get_iata_for_icao(icao)
+    if not iata:
+        results["error"] = f"Missing IATA code for ICAO {icao}"
+        return results
+
+    t = begin
+    while t < end:
+        date_str = datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+        for direction, collection in (("dep_iata", "departures"), ("arr_iata", "arrivals")):
+            try:
+                resp = await client.get(
+                    f"{AVIATIONSTACK_API_URL}/timetable",
+                    params={
+                        "access_key": AVIATIONSTACK_API_KEY,
+                        direction: iata,
+                        "flight_date": date_str,
+                    },
+                    timeout=60,
+                )
+            except Exception as e:
+                results["error"] = str(e)
+                logging.error("AviationStack fetch error for %s (%s): %s", icao, direction, e)
+                return results
+
+            if resp.status_code == 200:
+                payload = resp.json() or {}
+                results[collection].extend(payload.get("data", []))
+            elif resp.status_code == 429:
+                delay = int(resp.headers.get("Retry-After", "2"))
+                await asyncio.sleep(max(delay, 1))
+                continue
+            elif resp.status_code == 403:
+                results["error"] = "AviationStack API access restricted for this key"
+                logging.warning("AviationStack access restricted for %s: %s", icao, resp.text[:200])
+                return results
+            elif resp.status_code not in (404,):
+                logging.warning("AviationStack %s %s -> %s", icao, direction, resp.status_code)
+
+        if on_chunk_done:
+            await on_chunk_done()
+        t += 86400
+        await asyncio.sleep(0.25)
+
+    return results
+
+
+@mcp.tool()
+async def fetch_airport_activity_aerodata(
+    airport_icao: str,
+    days_back: int = 3,
+    ctx: Context | None = None,
+) -> dict:
+    """Fetch departures and arrivals for a specific African airport using AeroDataBox."""
+    if not AERODATA_API_KEY:
+        return {"error": "AERODATA_API_KEY is not configured."}
+
+    async def _impl():
+        _days_back = min(max(days_back, 1), 3)
+        icao = airport_icao.upper().strip()
+        airport = get_airport(icao)
+        if airport is None:
+            return {"error": f"Airport '{icao}' not found in African airport database."}
+
+        if ctx:
+            await ctx.report_progress(0, 3, f"Querying AeroDataBox for {icao}...")
+
+        now_utc = datetime.now(timezone.utc)
+        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        begin_ts = end_ts - (_days_back * 86400)
+
+        chunk_count = [0]
+        total_chunks = max(1, math.ceil((_days_back * 86400) / 43200))
+
+        async def _ping():
+            chunk_count[0] += 1
+            if ctx:
+                await ctx.report_progress(chunk_count[0], total_chunks, f"Fetching {icao} chunk {chunk_count[0]}/{total_chunks}")
+
+        async with httpx.AsyncClient(timeout=180) as client:
+            result = await _fetch_aerodatabox_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
+
+        if ctx:
+            await ctx.report_progress(3, 3, "Summarising results...")
+
+        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+        return {
+            "airport": airport,
+            "period_days": _days_back,
+            **summary,
+            "error": result["error"],
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=300)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 300 seconds"}
+
+
+@mcp.tool()
+async def fetch_airport_activity_aviationstack(
+    airport_icao: str,
+    days_back: int = 3,
+    ctx: Context | None = None,
+) -> dict:
+    """Fetch departures and arrivals for a specific African airport using AviationStack."""
+    if not AVIATIONSTACK_API_KEY:
+        return {"error": "AVIATIONSTACK_API_KEY is not configured."}
+
+    async def _impl():
+        _days_back = min(max(days_back, 1), 3)
+        icao = airport_icao.upper().strip()
+        airport = get_airport(icao)
+        if airport is None:
+            return {"error": f"Airport '{icao}' not found in African airport database."}
+
+        if ctx:
+            await ctx.report_progress(0, 3, f"Querying AviationStack for {icao}...")
+
+        now_utc = datetime.now(timezone.utc)
+        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        begin_ts = end_ts - (_days_back * 86400)
+
+        chunk_count = [0]
+        total_chunks = _days_back
+
+        async def _ping():
+            chunk_count[0] += 1
+            if ctx:
+                await ctx.report_progress(chunk_count[0], total_chunks, f"Fetching {icao} day {chunk_count[0]}/{total_chunks}")
+
+        async with httpx.AsyncClient(timeout=180) as client:
+            result = await _fetch_aviationstack_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
+
+        if ctx:
+            await ctx.report_progress(3, 3, "Summarising results...")
+
+        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+        return {
+            "airport": airport,
+            "period_days": _days_back,
+            **summary,
+            "error": result["error"],
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=300)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 300 seconds"}
+
+
+@mcp.tool()
+async def run_aerodatabox_report(
+    reduction_threshold_pct: float = 25.0,
+    ctx: Context | None = None,
+) -> dict:
+    """Run AeroDataBox activity across African airports over the past 3 days."""
+    if not AERODATA_API_KEY:
+        return {"error": "AERODATA_API_KEY is not configured."}
+
+    async def _impl():
+        now_utc = datetime.now(timezone.utc)
+        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        begin_ts = end_ts - (3 * 86400)
+
+        total_airports = len(AFRICAN_AIRPORTS)
+        completed = [0]
+        sem = asyncio.Semaphore(3)
+
+        async def _fetch_with_limit(airport: dict) -> dict:
+            async with sem:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    result = await _fetch_aerodatabox_airport(client, airport["icao"], begin_ts, end_ts)
+            completed[0] += 1
+            if ctx:
+                await ctx.report_progress(
+                    completed[0], total_airports,
+                    f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
+                )
+            return result
+
+        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
+        results = await asyncio.gather(*tasks)
+
+        country_report: dict[str, dict] = {}
+        airports_checked = 0
+        airports_flagged = 0
+
+        for airport_data, result in zip(AFRICAN_AIRPORTS, results):
+            airports_checked += 1
+            if result["error"]:
+                continue
+            all_flights = result["departures"] + result["arrivals"]
+            if not all_flights:
+                continue
+
+            summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+            if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
+                continue
+
+            airports_flagged += 1
+            country = airport_data["country"]
+            country_report.setdefault(country, {"airports": [], "total_flights": 0})
+            country_report[country]["airports"].append({
+                "icao": airport_data["icao"],
+                "name": airport_data["name"],
+                "city": airport_data["city"],
+                **summary,
+            })
+            country_report[country]["total_flights"] += summary["total_flights"]
+
+        return {
+            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "period": "past 3 days",
+            "reduction_threshold_pct": reduction_threshold_pct,
+            "airports_checked": airports_checked,
+            "airports_flagged": airports_flagged,
+            "countries_with_reductions": len(country_report),
+            "results": country_report,
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=300)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 300 seconds"}
+
+
+@mcp.tool()
+async def run_aviationstack_report(
+    reduction_threshold_pct: float = 25.0,
+    ctx: Context | None = None,
+) -> dict:
+    """Run AviationStack activity across African airports over the past 3 days."""
+    if not AVIATIONSTACK_API_KEY:
+        return {"error": "AVIATIONSTACK_API_KEY is not configured."}
+
+    async def _impl():
+        now_utc = datetime.now(timezone.utc)
+        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        begin_ts = end_ts - (3 * 86400)
+
+        total_airports = len(AFRICAN_AIRPORTS)
+        completed = [0]
+        sem = asyncio.Semaphore(2)
+
+        async def _fetch_with_limit(airport: dict) -> dict:
+            async with sem:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    result = await _fetch_aviationstack_airport(client, airport["icao"], begin_ts, end_ts)
+            completed[0] += 1
+            if ctx:
+                await ctx.report_progress(
+                    completed[0], total_airports,
+                    f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
+                )
+            return result
+
+        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
+        results = await asyncio.gather(*tasks)
+
+        country_report: dict[str, dict] = {}
+        airports_checked = 0
+        airports_flagged = 0
+
+        for airport_data, result in zip(AFRICAN_AIRPORTS, results):
+            airports_checked += 1
+            if result["error"]:
+                continue
+            all_flights = result["departures"] + result["arrivals"]
+            if not all_flights:
+                continue
+
+            summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
+            if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
+                continue
+
+            airports_flagged += 1
+            country = airport_data["country"]
+            country_report.setdefault(country, {"airports": [], "total_flights": 0})
+            country_report[country]["airports"].append({
+                "icao": airport_data["icao"],
+                "name": airport_data["name"],
+                "city": airport_data["city"],
+                **summary,
+            })
+            country_report[country]["total_flights"] += summary["total_flights"]
+
+        return {
+            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "period": "past 3 days",
+            "reduction_threshold_pct": reduction_threshold_pct,
+            "airports_checked": airports_checked,
+            "airports_flagged": airports_flagged,
+            "countries_with_reductions": len(country_report),
+            "results": country_report,
+        }
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=300)
+    except asyncio.TimeoutError:
+        return {"error": "Query timed out after 300 seconds"}
+
+
 # ---------------------------------------------------------------------------
 # Diagnostic tool
 # ---------------------------------------------------------------------------
@@ -756,6 +1147,8 @@ async def test_connectivity() -> dict:
         "acled_password_set": bool(ACLED_PASSWORD),
         "opensky_username_set": bool(OPENSKY_USERNAME),
         "opensky_password_set": bool(OPENSKY_PASSWORD),
+        "aerodatabox_api_key_set": bool(AERODATA_API_KEY),
+        "aviationstack_api_key_set": bool(AVIATIONSTACK_API_KEY),
     }
 
     # Test ACLED token endpoint
@@ -788,6 +1181,37 @@ async def test_connectivity() -> dict:
             results["opensky_body"] = resp.text[:500]
     except Exception as exc:
         results["opensky_error"] = str(exc)
+
+    if AERODATA_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{AERODATA_API_URL}/flights/airports/icao/HKJK/{datetime.utcfromtimestamp(int(time.time() - 43200)).strftime('%Y-%m-%dT%H:%M')}/{datetime.utcfromtimestamp(int(time.time())).strftime('%Y-%m-%dT%H:%M')}",
+                    headers={
+                        "X-RapidAPI-Key": AERODATA_API_KEY,
+                        "X-RapidAPI-Host": AERODATA_API_HOST,
+                    },
+                )
+                results["aerodatabox_status"] = resp.status_code
+                results["aerodatabox_body"] = resp.text[:500]
+        except Exception as exc:
+            results["aerodatabox_error"] = str(exc)
+
+    if AVIATIONSTACK_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{AVIATIONSTACK_API_URL}/timetable",
+                    params={
+                        "access_key": AVIATIONSTACK_API_KEY,
+                        "dep_iata": "NBO",
+                        "flight_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                    },
+                )
+                results["aviationstack_status"] = resp.status_code
+                results["aviationstack_body"] = resp.text[:500]
+        except Exception as exc:
+            results["aviationstack_error"] = str(exc)
 
     # Test basic DNS / outbound connectivity
     try:
