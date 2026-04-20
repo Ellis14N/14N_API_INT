@@ -836,42 +836,60 @@ async def _fetch_aviationstack_airport(
         results["error"] = f"Missing IATA code for ICAO {icao}"
         return results
 
-    t = begin
-    while t < end:
-        date_str = datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+    while begin < end:
+        date_str = datetime.utcfromtimestamp(begin).strftime("%Y-%m-%d")
         for direction, collection in (("dep_iata", "departures"), ("arr_iata", "arrivals")):
-            try:
-                resp = await client.get(
-                    f"{AVIATIONSTACK_API_URL}/timetable",
-                    params={
-                        "access_key": AVIATIONSTACK_API_KEY,
-                        direction: iata,
-                        "flight_date": date_str,
-                    },
-                    timeout=60,
-                )
-            except Exception as e:
-                results["error"] = str(e)
-                logging.error("AviationStack fetch error for %s (%s): %s", icao, direction, e)
-                return results
+            offset = 0
+            limit = 1000
+            while True:
+                try:
+                    resp = await client.get(
+                        f"{AVIATIONSTACK_API_URL}/flights",
+                        params={
+                            "access_key": AVIATIONSTACK_API_KEY,
+                            direction: iata,
+                            "flight_date": date_str,
+                            "limit": limit,
+                            "offset": offset,
+                        },
+                        timeout=60,
+                    )
+                except Exception as e:
+                    results["error"] = str(e)
+                    logging.error("AviationStack fetch error for %s (%s): %s", icao, direction, e)
+                    return results
 
-            if resp.status_code == 200:
-                payload = resp.json() or {}
-                results[collection].extend(payload.get("data", []))
-            elif resp.status_code == 429:
-                delay = int(resp.headers.get("Retry-After", "2"))
-                await asyncio.sleep(max(delay, 1))
-                continue
-            elif resp.status_code == 403:
-                results["error"] = "AviationStack API access restricted for this key"
-                logging.warning("AviationStack access restricted for %s: %s", icao, resp.text[:200])
-                return results
-            elif resp.status_code not in (404,):
-                logging.warning("AviationStack %s %s -> %s", icao, direction, resp.status_code)
+                if resp.status_code == 200:
+                    payload = resp.json() or {}
+                    data = payload.get("data", []) or []
+                    results[collection].extend(data)
+
+                    pagination = payload.get("pagination", {})
+                    count = pagination.get("count", len(data))
+                    total = pagination.get("total", offset + count)
+                    offset += count
+                    if count == 0 or offset >= total:
+                        break
+                    await asyncio.sleep(0.25)
+                    continue
+                elif resp.status_code == 429:
+                    delay = int(resp.headers.get("Retry-After", "2"))
+                    await asyncio.sleep(max(delay, 1))
+                    continue
+                elif resp.status_code == 403:
+                    results["error"] = "AviationStack API access restricted for this key"
+                    logging.warning("AviationStack access restricted for %s: %s", icao, resp.text[:200])
+                    return results
+                elif resp.status_code == 404:
+                    logging.warning("AviationStack %s %s -> %s", icao, direction, resp.status_code)
+                    break
+                else:
+                    logging.warning("AviationStack %s %s -> %s", icao, direction, resp.status_code)
+                    break
 
         if on_chunk_done:
             await on_chunk_done()
-        t += 86400
+        begin += 86400
         await asyncio.sleep(0.25)
 
     return results
@@ -1202,11 +1220,12 @@ async def test_connectivity() -> dict:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
-                    f"{AVIATIONSTACK_API_URL}/timetable",
+                    f"{AVIATIONSTACK_API_URL}/flights",
                     params={
                         "access_key": AVIATIONSTACK_API_KEY,
                         "dep_iata": "NBO",
                         "flight_date": datetime.utcnow().strftime("%Y-%m-%d"),
+                        "limit": 1,
                     },
                 )
                 results["aviationstack_status"] = resp.status_code
