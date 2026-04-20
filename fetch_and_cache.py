@@ -243,21 +243,8 @@ async def cache_acled_report() -> None:
 
 async def cache_travel_advisories() -> None:
     logging.info("Caching travel advisories (DFAT / State Dept / FCDO / MEAE)")
-    # Get list of destinations from DFAT export when available
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        try:
-            dfat_map = await travel_advisories.fetch_dfat_table(client)
-            if dfat_map:
-                countries = [v.get("name") or k for k, v in dfat_map.items()]
-            else:
-                # Fall back to a neutral canonical list of African country names
-                # (this list is independent of ACLED-specific naming).
-                countries = AFRICAN_CANONICAL_NAMES
-        except Exception as e:
-            logging.error("Failed to fetch DFAT export: %s", e)
-            countries = AFRICAN_CANONICAL_NAMES
-
-    logging.info("Fetching advisories for %d countries...", len(countries))
+    countries = AFRICAN_CANONICAL_NAMES
+    logging.info("Fetching advisories for %d African countries...", len(countries))
     try:
         advisories = await travel_advisories.fetch_advisories_for_countries(countries)
     except Exception as e:
