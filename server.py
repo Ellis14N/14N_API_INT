@@ -616,7 +616,17 @@ async def run_unhcr_report() -> dict:
                 "message": "UNHCR cache has not been generated yet. Trigger the 'Cache UNHCR Displacement Data' workflow manually in GitHub Actions.",
             }
         resp.raise_for_status()
-        return resp.json()["data"]
+        data = resp.json()["data"]
+
+        # Sort countries by absolute YoY % change (largest movers first)
+        def _sort_key(item):
+            pct = (item[1].get("inflow", {}).get("trend", {}).get("change_pct") or 0)
+            return abs(pct)
+
+        data["countries"] = dict(
+            sorted(data["countries"].items(), key=_sort_key, reverse=True)
+        )
+        return data
     except Exception as e:
         return {"error": f"Cache fetch failed: {e}"}
 
