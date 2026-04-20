@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from countries import ACLED_NAMES
+import travel_advisories
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -239,9 +240,46 @@ async def cache_acled_report() -> None:
         logging.error("ACLED cache failed: %s", e)
 
 
+async def cache_travel_advisories() -> None:
+    logging.info("Caching travel advisories (DFAT / State Dept / FCDO / MEAE)")
+    # Get list of destinations from DFAT export when available
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            dfat_map = await travel_advisories.fetch_dfat_table(client)
+            if dfat_map:
+                countries = [v.get("name") or k for k, v in dfat_map.items()]
+            else:
+                countries = ACLED_NAMES
+        except Exception as e:
+            logging.error("Failed to fetch DFAT export: %s", e)
+            countries = ACLED_NAMES
+
+    logging.info("Fetching advisories for %d countries...", len(countries))
+    try:
+        advisories = await travel_advisories.fetch_advisories_for_countries(countries)
+    except Exception as e:
+        logging.error("Failed to fetch travel advisories: %s", e)
+        advisories = {}
+
+    _write_cache("travel_advisories", advisories)
+    # Also write a 'latest' copy for quick access
+    latest_path = CACHE_DIR / "travel_advisories_latest.json"
+    try:
+        with open(latest_path, "w") as f:
+            json.dump({"timestamp": datetime.utcnow().isoformat(), "data": advisories}, f)
+        logging.info("Wrote latest travel advisories cache: %s", latest_path)
+    except Exception as e:
+        logging.error("Failed to write latest travel advisories cache: %s", e)
+
+
 async def main() -> None:
     logging.info("Starting daily cache refresh")
     await cache_acled_report()
+    # Cache travel advisories for all DFAT-exported destinations (or ACLED_NAMES fallback)
+    try:
+        await cache_travel_advisories()
+    except Exception as e:
+        logging.error("Travel advisories cache failed: %s", e)
     logging.info("Cache refresh complete")
 
 

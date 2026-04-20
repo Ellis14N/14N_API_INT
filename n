@@ -1,0 +1,24 @@
+To Do:
+
+1. ACLED API doesn't work due to a lack of permissions,
+2. Travel Advisories does not work for US or AUS,
+3. Explore UNHCR data for inclusion. 
+    - Data to show:
+        - Total number of Displaced Persons
+        - Displacement flow
+            (i.e., 22 origin countries -> Sudan | YoY Decreasing (-11.7%))
+        - 
+4. Weather and Severe Event Data inclusion.
+    - RCC ACMAD 10-Day Bulletin
+    - GloFAS Flood Forecasting
+    - GDACS
+    - RSMC La Reunion Cyclone Bulletin
+    - CAMS Africa Atmospheric Hazards
+    - ICPAC (Droughtwatch + EA Hazards Watch)
+    - RCC ACMAD Decadal Bulletin
+    - FAO DIEM Monitoring
+
+5. Aviation Date does not work as a result of limited tokens on free tiers. 
+
+
+EXPLORE GITHUB ACTION / GITHUB MCP / GITHUB SCHEDULED TASK
