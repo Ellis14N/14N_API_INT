@@ -717,14 +717,11 @@ async def run_opensky_report(
     reduction_threshold_pct: float = 25.0,
     ctx: Context | None = None,
 ) -> dict:
-    """Run OpenSky Data across all major African airports over the past 3 days.
+    """Return today's cached OpenSky traffic reduction report across African airports (past 3 days).
 
-    Returns airports that have experienced a reduction in air traffic of at least
-    reduction_threshold_pct% (default 25%), comparing the first half of the window
-    to the second half.
-
-    Args:
-        reduction_threshold_pct: Minimum % reduction in flights to include an airport (default 25.0).
+    Returns airports where flight volume dropped >25% comparing the first half of the
+    window to the second half, plus top 20 airports by reduction percentage.
+    Data is refreshed daily by the cron job.
     """
     # Check for cached data first
     cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
@@ -978,7 +975,11 @@ async def run_aerodatabox_report(
     reduction_threshold_pct: float = 25.0,
     ctx: Context | None = None,
 ) -> dict:
-    """Run AeroDataBox activity across African airports over the past 3 days."""
+    """Return today's cached AeroDataBox traffic reduction report across African airports (past 3 days).
+
+    Returns airports where flight volume dropped >25%, plus top 20 by reduction percentage.
+    Data is refreshed daily by the cron job.
+    """
     if not AERODATA_API_KEY:
         return {"error": "AERODATA_API_KEY is not configured."}
 
@@ -1009,7 +1010,11 @@ async def run_aviationstack_report(
     reduction_threshold_pct: float = 25.0,
     ctx: Context | None = None,
 ) -> dict:
-    """Run AviationStack activity across African airports over the past 3 days."""
+    """Return today's cached AviationStack traffic reduction report across African airports (past 3 days).
+
+    Returns airports where flight volume dropped >25%, plus top 20 by reduction percentage.
+    Data is refreshed daily by the cron job.
+    """
     if not AVIATIONSTACK_API_KEY:
         return {"error": "AVIATIONSTACK_API_KEY is not configured."}
 
@@ -1035,8 +1040,14 @@ async def run_aviationstack_report(
 
 @mcp.tool()
 async def scan_african_airports_for_disruptions() -> dict:
-    """Return today's cached report of African airports with significant flight disruptions
-    (cancelled or delayed flights exceeding 25% of scheduled services over the past 3 days).
+    """Return today's cached aviation disruption report across African airports (past 3 days).
+
+    Per provider (AeroDataBox, AviationStack) returns:
+      - above_25pct_disruption: airports where cancelled+delayed > 25% of flights
+      - top_by_disruption_count: top 20 airports by total disrupted flights
+      - top_by_disruption_pct: top 20 airports by disruption percentage
+
+    Note: OpenSky does not expose flight status fields so is excluded from disruption data.
     Data is refreshed daily by the cron job.
     """
     cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
