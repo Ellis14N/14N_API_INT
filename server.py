@@ -515,6 +515,23 @@ async def _fetch_opensky_airport(
     return results
 
 
+def _extract_operator_from_callsign(callsign: str | None) -> str | None:
+    if not callsign:
+        return None
+    normalized = ''.join(ch for ch in callsign.upper().strip() if ch.isalnum())
+    if not normalized:
+        return None
+    letters = ''
+    for ch in normalized:
+        if ch.isalpha():
+            letters += ch
+        else:
+            break
+    if len(letters) < 2:
+        return None
+    return letters
+
+
 def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = None, end_ts: int | None = None) -> dict:
     """Build a summary with totals, daily time series, and trend vs first half of window."""
     from collections import defaultdict
@@ -522,14 +539,24 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
 
     all_flights = departures + arrivals
     daily: dict[str, int] = defaultdict(int)
+    airline_codes: set[str] = set()
+    latest_flight_ts: int | None = None
+    operating_last_24h = False
 
     for flight in all_flights:
         ts = flight.get("firstSeen") or flight.get("lastSeen")
-        if not ts:
-            continue
-        d = datetime.utcfromtimestamp(ts)
-        key = d.strftime("%Y-%m-%d")
-        daily[key] += 1
+        if ts:
+            d = datetime.utcfromtimestamp(ts)
+            key = d.strftime("%Y-%m-%d")
+            daily[key] += 1
+            if latest_flight_ts is None or ts > latest_flight_ts:
+                latest_flight_ts = ts
+            if end_ts is not None and ts >= end_ts - 86400:
+                operating_last_24h = True
+
+        operator = _extract_operator_from_callsign(flight.get("callsign"))
+        if operator:
+            airline_codes.add(operator)
 
     # Calculate reduction % if window boundaries provided
     reduction_pct: float | None = None
@@ -540,12 +567,20 @@ def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = 
         if len(first_half) > 0:
             reduction_pct = round((len(first_half) - len(second_half)) / len(first_half) * 100, 1)
 
+    latest_flight_date: str | None = None
+    if latest_flight_ts is not None:
+        latest_flight_date = datetime.utcfromtimestamp(latest_flight_ts).strftime("%Y-%m-%d")
+
     return {
         "total_flights": len(all_flights),
         "total_departures": len(departures),
         "total_arrivals": len(arrivals),
         "daily_series": dict(sorted(daily.items())),
         "reduction_pct": reduction_pct,
+        "operating": len(all_flights) > 0,
+        "operating_last_24h": operating_last_24h,
+        "latest_flight_date": latest_flight_date,
+        "airlines": sorted(airline_codes),
     }
 
 
