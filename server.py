@@ -632,7 +632,7 @@ async def run_weather_report() -> dict:
         if resp.status_code == 404:
             return {
                 "error": "Data not yet available",
-                "message": f"Weather cache for {today_label} has not been generated yet. It refreshes daily at 04:00 UTC. Trigger the workflow manually in GitHub Actions.",
+                "message": f"Weather cache for {today_label} has not been generated yet. It refreshes daily at 01:00 UTC (02:00 Morocco). Trigger the workflow manually in GitHub Actions.",
             }
         resp.raise_for_status()
         return resp.json()["data"]
