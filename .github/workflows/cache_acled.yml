@@ -1,0 +1,53 @@
+name: Cache ACLED Report
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 01:00 UTC = 02:00 Morocco summer time (UTC+1)
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write           # needed to commit cache files to data branch
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx python-dotenv
+
+      - name: Run ACLED cache job
+        env:
+          ACLED_USERNAME: ${{ secrets.ACLED_USERNAME }}
+          ACLED_PASSWORD: ${{ secrets.ACLED_PASSWORD }}
+        run: python fetch_and_cache.py --task acled
+
+      - name: Commit cache files to data branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Switch to (or create) the data branch without losing working tree files
+          git fetch origin data:data 2>/dev/null || git checkout --orphan data && git rm -rf . --quiet 2>/dev/null || true
+          git checkout data 2>/dev/null || (git checkout --orphan data && git rm -rf . --quiet)
+
+          # Bring cache directory back from main
+          git checkout main -- cache/ 2>/dev/null || true
+
+          # Stage and commit only the cache files we just wrote
+          git add cache/acled_conflicts_*.json
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update ACLED cache $(date -u +%Y-%m-%d)"
+          git push origin data
