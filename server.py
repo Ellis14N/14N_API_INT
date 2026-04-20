@@ -777,8 +777,8 @@ async def _fetch_aerodatabox_airport(
             results["departures"].extend(payload.get("departures", []))
             results["arrivals"].extend(payload.get("arrivals", []))
         elif resp.status_code == 429:
-            delay = int(resp.headers.get("Retry-After", "2"))
-            await asyncio.sleep(max(delay, 1))
+            delay = int(resp.headers.get("Retry-After", "30"))
+            await asyncio.sleep(max(delay, 30))
             continue
         elif resp.status_code not in (404,):
             logging.warning("AeroDataBox %s %s -> %s", icao, begin_s, resp.status_code)

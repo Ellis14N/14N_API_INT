@@ -118,7 +118,7 @@ async def cache_traffic_reductions() -> None:
 
     if AERODATA_API_KEY:
         try:
-            pairs = await _scan_airports(_fetch_aerodatabox_airport, MAJOR_AFRICAN_AIRPORTS, begin_ts, end_ts, concurrency=3)
+            pairs = await _scan_airports(_fetch_aerodatabox_airport, MAJOR_AFRICAN_AIRPORTS, begin_ts, end_ts, concurrency=1)
             reports["aerodatabox"] = _build_reduction_report(pairs, begin_ts, end_ts)
             logging.info("AeroDataBox: %d airports above threshold", reports["aerodatabox"]["airports_above_threshold"])
         except Exception as e:
@@ -177,7 +177,7 @@ async def cache_aviation_disruptions() -> None:
 
     if AERODATA_API_KEY:
         try:
-            pairs = await _scan_airports(_fetch_aerodatabox_airport, MAJOR_AFRICAN_AIRPORTS, begin_ts, end_ts, concurrency=3)
+            pairs = await _scan_airports(_fetch_aerodatabox_airport, MAJOR_AFRICAN_AIRPORTS, begin_ts, end_ts, concurrency=1)
             reports["aerodatabox"] = _build_disruption_report(pairs)
             logging.info("AeroDataBox disruptions: %d above threshold", reports["aerodatabox"]["airports_above_threshold"])
         except Exception as e:
