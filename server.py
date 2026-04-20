@@ -4,7 +4,6 @@ import logging
 import math
 import os
 import time
-from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -494,44 +493,38 @@ async def fetch_travel_advisories(country: str) -> dict:
 
 @mcp.tool()
 async def run_travel_advisories_report() -> dict:
-    """Fetch live travel advisories for all 54 African countries and report any new or elevated advisories since yesterday.
+    """Run the daily travel advisory report for all 54 African countries.
 
-    Fetches current data live from UK FCDO, US State Department, Australian DFAT, and French MEAE,
-    then compares against yesterday's snapshot to surface level increases.
+    Reads today's cached snapshot (populated at 02:00 Morocco time by GitHub Actions)
+    and compares against yesterday's to surface any new or elevated advisories.
     """
-    from travel_advisories import fetch_advisories_for_countries
-
-    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
-    cache_dir.mkdir(exist_ok=True)
+    GITHUB_RAW = "https://raw.githubusercontent.com/Ellis14N/14N_API_INT/data/cache"
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-    yesterday_file = cache_dir / f"travel_advisories_{yesterday_str}.json"
 
+    # Load today's cache from GitHub data branch
     try:
-        # Use a neutral canonical list of African country names for advisory fetches.
-        today_data: dict = await asyncio.wait_for(
-            fetch_advisories_for_countries(AFRICAN_CANONICAL_NAMES), timeout=120
-        )
-    except asyncio.TimeoutError:
-        return {"error": "Live fetch timed out after 120 seconds"}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{GITHUB_RAW}/travel_advisories_{today_str}.json")
+        if resp.status_code == 404:
+            return {
+                "error": "Data not yet available",
+                "message": f"Travel advisory cache for {today_str} has not been generated yet. It refreshes daily at 02:00 Morocco time. Try again later or trigger the workflow manually in GitHub Actions.",
+            }
+        resp.raise_for_status()
+        today_data: dict = resp.json()["data"]
     except Exception as e:
-        return {"error": f"Live fetch failed: {e}"}
+        return {"error": f"Cache fetch failed: {e}"}
 
-    # Write today's result to cache for tomorrow's diff
-    try:
-        today_file = cache_dir / f"travel_advisories_{today_str}.json"
-        with open(today_file, "w") as f:
-            json.dump({"timestamp": datetime.utcnow().isoformat(), "data": today_data}, f)
-    except Exception as e:
-        logging.warning("Could not write travel advisory cache: %s", e)
-
+    # Load yesterday's cache for diff
     yesterday_data: dict = {}
-    if yesterday_file.exists():
-        try:
-            with open(yesterday_file) as f:
-                yesterday_data = json.load(f)["data"]
-        except Exception:
-            pass
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{GITHUB_RAW}/travel_advisories_{yesterday_str}.json")
+        if resp.status_code == 200:
+            yesterday_data = resp.json().get("data", {})
+    except Exception as e:
+        logging.warning("Could not load yesterday's advisory cache: %s", e)
 
     sources = ("fcdo", "us_state_dept", "aus_dfat", "french_meae")
     source_labels = {
@@ -632,35 +625,5 @@ async def test_connectivity() -> dict:
     return results
 
 
-# ---------------------------------------------------------------------------
-# Daily cache scheduler — 03:00 UTC = 04:00 Morocco summer time
-# ---------------------------------------------------------------------------
-
-async def _daily_cache_loop() -> None:
-    import fetch_and_cache
-    while True:
-        now = datetime.now(timezone.utc)
-        next_run = now.replace(hour=3, minute=0, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += timedelta(days=1)
-        delay = (next_run - now).total_seconds()
-        logging.info("Cache refresh in %.0f s (at %s UTC)", delay, next_run.strftime("%Y-%m-%d %H:%M"))
-        await asyncio.sleep(delay)
-        try:
-            await fetch_and_cache.main()
-        except Exception as exc:
-            logging.error("Daily cache refresh failed: %s", exc)
-
-
 if __name__ == "__main__":
-    @asynccontextmanager
-    async def lifespan(server):
-        task = asyncio.create_task(_daily_cache_loop())
-        try:
-            yield
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    mcp.settings.lifespan = lifespan
     mcp.run(transport="streamable-http")
