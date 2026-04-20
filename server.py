@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 
 from countries import ACLED_NAMES, resolve_country, AFRICAN_CANONICAL_NAMES
-from travel_advisories import fetch_all_advisories
+
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -475,20 +475,6 @@ When asked about travel advisories:
 Keep responses concise and intelligence-focused. Flag the most severe changes first.
 """.strip()
 
-
-@mcp.tool()
-async def fetch_travel_advisories(country: str) -> dict:
-    """Fetch live travel advisories for a specific country from UK FCDO, US State Department, Australian DFAT, and French MEAE.
-
-    Use this when you need the current advisory for a single country on demand.
-
-    Args:
-        country: Country name (e.g. "Mali", "Somalia", "Democratic Republic of the Congo").
-    """
-    try:
-        return await asyncio.wait_for(fetch_all_advisories(country), timeout=45)
-    except asyncio.TimeoutError:
-        return {"error": "Advisory fetch timed out after 45 seconds"}
 
 
 @mcp.tool()
