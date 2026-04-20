@@ -1,14 +1,15 @@
 import asyncio
+import json
 import logging
 import math
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
-from datetime import date, datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # Timeout configuration
@@ -25,7 +26,7 @@ from datetime import date, datetime, timedelta, timezone
 # ---------------------------------------------------------------------------
 
 from countries import ACLED_NAMES, resolve_country
-from airports import AFRICAN_AIRPORTS, AIRPORTS_BY_COUNTRY, get_airport
+from airports import AFRICAN_AIRPORTS, get_airport
 from icao_iata import ICAO_TO_IATA
 
 logging.basicConfig(level=logging.INFO)
@@ -378,6 +379,18 @@ async def run_africa_report(
         facility_lon: Optional longitude of an operating facility for
                       Trigger 2 (armed group proximity) checks.
     """
+    # Serve from cache when facility coords aren't specified (cached data has no facility filter)
+    if facility_lat is None and facility_lon is None:
+        cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+        cache_file = cache_dir / f"acled_conflicts_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    cached = json.load(f)
+                return cached["data"]
+            except Exception as e:
+                logging.warning("ACLED cache read failed: %s", e)
+
     async def _impl():
         date_to = date.today()
         date_from = date_to - timedelta(days=30)
@@ -713,79 +726,26 @@ async def run_opensky_report(
     Args:
         reduction_threshold_pct: Minimum % reduction in flights to include an airport (default 25.0).
     """
-    async def _impl():
-        # End at start of today UTC — OpenSky batches data overnight
-        from datetime import datetime, timezone
-        now_utc = datetime.now(timezone.utc)
-        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        begin_ts = end_ts - (3 * 86400)
+    # Check for cached data first
+    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+    cache_file = cache_dir / f"traffic_reductions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
 
-        total_airports = len(AFRICAN_AIRPORTS)
-        completed = [0]  # mutable counter for closure
-        sem = asyncio.Semaphore(5)  # max 5 airports concurrently to avoid rate limits
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+            if "opensky" in cached_data["data"]:
+                return cached_data["data"]["opensky"]
+        except Exception as e:
+            print(f"Cache read failed: {e}")
 
-        async def _fetch_with_limit(airport: dict) -> dict:
-            async with sem:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    result = await _fetch_opensky_airport(client, airport["icao"], begin_ts, end_ts)
-                completed[0] += 1
-                if ctx:
-                    await ctx.report_progress(
-                        completed[0], total_airports,
-                        f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
-                    )
-                return result
-
-        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
-        results = await asyncio.gather(*tasks)
-
-        # Group by country, only including airports with >= threshold reduction
-        country_report: dict[str, dict] = {}
-        airports_checked = 0
-        airports_flagged = 0
-
-        for airport_data, result in zip(AFRICAN_AIRPORTS, results):
-            airports_checked += 1
-
-            # Primary filter: skip airports with no flight data before any further processing
-            all_flights = result["departures"] + result["arrivals"]
-            if not all_flights:
-                continue
-
-            summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-
-            # Primary filter: must meet reduction threshold
-            if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
-                continue
-
-            airports_flagged += 1
-            country = airport_data["country"]
-            if country not in country_report:
-                country_report[country] = {"airports": [], "total_flights": 0}
-
-            country_report[country]["airports"].append({
-                "icao": airport_data["icao"],
-                "name": airport_data["name"],
-                "city": airport_data["city"],
-                **summary,
-            })
-            country_report[country]["total_flights"] += summary["total_flights"]
-
-        from datetime import datetime
-        return {
-            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-            "period": "past 3 days",
-            "reduction_threshold_pct": reduction_threshold_pct,
-            "airports_checked": airports_checked,
-            "airports_flagged": airports_flagged,
-            "countries_with_reductions": len(country_report),
-            "results": country_report,
-        }
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=300)
-    except asyncio.TimeoutError:
-        return {"error": "Query timed out after 300 seconds"}
+    # No cache available - return message about data refresh
+    return {
+        "error": "Data not yet available",
+        "message": "Traffic reduction data is being refreshed. Please try again in a few minutes.",
+        "next_refresh": "Data refreshes daily at midnight UTC",
+        "cache_file_checked": str(cache_file)
+    }
 
 
 async def _fetch_aerodatabox_airport(
@@ -1022,71 +982,26 @@ async def run_aerodatabox_report(
     if not AERODATA_API_KEY:
         return {"error": "AERODATA_API_KEY is not configured."}
 
-    async def _impl():
-        now_utc = datetime.now(timezone.utc)
-        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        begin_ts = end_ts - (3 * 86400)
+    # Check for cached data first
+    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+    cache_file = cache_dir / f"traffic_reductions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
 
-        total_airports = len(AFRICAN_AIRPORTS)
-        completed = [0]
-        sem = asyncio.Semaphore(3)
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+            if "aerodatabox" in cached_data["data"]:
+                return cached_data["data"]["aerodatabox"]
+        except Exception as e:
+            print(f"Cache read failed: {e}")
 
-        async def _fetch_with_limit(airport: dict) -> dict:
-            async with sem:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    result = await _fetch_aerodatabox_airport(client, airport["icao"], begin_ts, end_ts)
-            completed[0] += 1
-            if ctx:
-                await ctx.report_progress(
-                    completed[0], total_airports,
-                    f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
-                )
-            return result
-
-        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
-        results = await asyncio.gather(*tasks)
-
-        country_report: dict[str, dict] = {}
-        airports_checked = 0
-        airports_flagged = 0
-
-        for airport_data, result in zip(AFRICAN_AIRPORTS, results):
-            airports_checked += 1
-            if result["error"]:
-                continue
-            all_flights = result["departures"] + result["arrivals"]
-            if not all_flights:
-                continue
-
-            summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-            if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
-                continue
-
-            airports_flagged += 1
-            country = airport_data["country"]
-            country_report.setdefault(country, {"airports": [], "total_flights": 0})
-            country_report[country]["airports"].append({
-                "icao": airport_data["icao"],
-                "name": airport_data["name"],
-                "city": airport_data["city"],
-                **summary,
-            })
-            country_report[country]["total_flights"] += summary["total_flights"]
-
-        return {
-            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-            "period": "past 3 days",
-            "reduction_threshold_pct": reduction_threshold_pct,
-            "airports_checked": airports_checked,
-            "airports_flagged": airports_flagged,
-            "countries_with_reductions": len(country_report),
-            "results": country_report,
-        }
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=300)
-    except asyncio.TimeoutError:
-        return {"error": "Query timed out after 300 seconds"}
+    # No cache available - return message about data refresh
+    return {
+        "error": "Data not yet available",
+        "message": "Traffic reduction data is being refreshed. Please try again in a few minutes.",
+        "next_refresh": "Data refreshes daily at midnight UTC",
+        "cache_file_checked": str(cache_file)
+    }
 
 
 @mcp.tool()
@@ -1098,294 +1013,47 @@ async def run_aviationstack_report(
     if not AVIATIONSTACK_API_KEY:
         return {"error": "AVIATIONSTACK_API_KEY is not configured."}
 
-    async def _impl():
-        now_utc = datetime.now(timezone.utc)
-        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        begin_ts = end_ts - (3 * 86400)
+    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+    cache_file = cache_dir / f"traffic_reductions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
 
-        total_airports = len(AFRICAN_AIRPORTS)
-        completed = [0]
-        sem = asyncio.Semaphore(2)
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r") as f:
+                cached_data = json.load(f)
+            if "aviationstack" in cached_data["data"]:
+                return cached_data["data"]["aviationstack"]
+        except Exception as e:
+            print(f"Cache read failed: {e}")
 
-        async def _fetch_with_limit(airport: dict) -> dict:
-            async with sem:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    result = await _fetch_aviationstack_airport(client, airport["icao"], begin_ts, end_ts)
-            completed[0] += 1
-            if ctx:
-                await ctx.report_progress(
-                    completed[0], total_airports,
-                    f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
-                )
-            return result
-
-        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
-        results = await asyncio.gather(*tasks)
-
-        country_report: dict[str, dict] = {}
-        airports_checked = 0
-        airports_flagged = 0
-
-        for airport_data, result in zip(AFRICAN_AIRPORTS, results):
-            airports_checked += 1
-            if result["error"]:
-                continue
-            all_flights = result["departures"] + result["arrivals"]
-            if not all_flights:
-                continue
-
-            summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-            if summary["reduction_pct"] is None or summary["reduction_pct"] < reduction_threshold_pct:
-                continue
-
-            airports_flagged += 1
-            country = airport_data["country"]
-            country_report.setdefault(country, {"airports": [], "total_flights": 0})
-            country_report[country]["airports"].append({
-                "icao": airport_data["icao"],
-                "name": airport_data["name"],
-                "city": airport_data["city"],
-                **summary,
-            })
-            country_report[country]["total_flights"] += summary["total_flights"]
-
-        return {
-            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-            "period": "past 3 days",
-            "reduction_threshold_pct": reduction_threshold_pct,
-            "airports_checked": airports_checked,
-            "airports_flagged": airports_flagged,
-            "countries_with_reductions": len(country_report),
-            "results": country_report,
-        }
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=300)
-    except asyncio.TimeoutError:
-        return {"error": "Query timed out after 300 seconds"}
+    return {
+        "error": "Data not yet available",
+        "message": "Traffic reduction data is being refreshed. Please try again in a few minutes.",
+        "next_refresh": "Data refreshes daily at midnight UTC",
+        "cache_file_checked": str(cache_file),
+    }
 
 
 @mcp.tool()
-async def scan_african_airports_for_disruptions(
-    provider: str = "aviationstack",
-    days_back: int = 3,
-    disruption_threshold_pct: float = 25.0,
-    sort_by: str = "disruption_pct",
-    airport_list: list[str] | None = None,
-    ctx: Context | None = None,
-) -> dict:
-    """Scan African airports for flight disruptions (cancelled or delayed flights) exceeding a threshold.
-
-    Args:
-        provider: Data provider to use ('aviationstack' or 'aerodatabox').
-        days_back: Number of days to look back (default 3).
-        disruption_threshold_pct: Minimum % of flights that must be disrupted (default 25.0).
-        sort_by: Sort results by 'disruption_pct' or 'total_disruptions' (default 'disruption_pct').
-        airport_list: Optional list of ICAO codes to scan (default all African airports).
+async def scan_african_airports_for_disruptions() -> dict:
+    """Return today's cached report of African airports with significant flight disruptions
+    (cancelled or delayed flights exceeding 25% of scheduled services over the past 3 days).
+    Data is refreshed daily by the cron job.
     """
-    if provider not in ("aviationstack", "aerodatabox"):
-        return {"error": f"Unsupported provider: {provider}. Use 'aviationstack' or 'aerodatabox'."}
+    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+    cache_file = cache_dir / f"aviation_disruptions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
 
-    if provider == "aviationstack" and not AVIATIONSTACK_API_KEY:
-        return {"error": "AVIATIONSTACK_API_KEY is not configured."}
-    if provider == "aerodatabox" and not AERODATA_API_KEY:
-        return {"error": "AERODATA_API_KEY is not configured."}
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r") as f:
+                return json.load(f)["data"]
+        except Exception as e:
+            return {"error": f"Cache read failed: {e}"}
 
-    async def _impl():
-        _days_back = min(max(days_back, 1), 3)
-        now_utc = datetime.now(timezone.utc)
-        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        begin_ts = end_ts - (_days_back * 86400)
-
-        # Select airports to scan
-        if airport_list:
-            airports_to_scan = [a for a in AFRICAN_AIRPORTS if a["icao"] in airport_list]
-        else:
-            airports_to_scan = AFRICAN_AIRPORTS
-
-        total_airports = len(airports_to_scan)
-        completed = [0]
-        sem = asyncio.Semaphore(2 if provider == "aviationstack" else 3)
-
-        disrupted_airports = []
-
-        async def _fetch_with_limit(airport: dict) -> None:
-            async with sem:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    if provider == "aviationstack":
-                        result = await _fetch_aviationstack_airport(client, airport["icao"], begin_ts, end_ts)
-                    else:
-                        result = await _fetch_aerodatabox_airport(client, airport["icao"], begin_ts, end_ts)
-
-                completed[0] += 1
-                if ctx:
-                    await ctx.report_progress(
-                        completed[0], total_airports,
-                        f"Scanned {completed[0]}/{total_airports} airports ({airport['icao']})"
-                    )
-
-                if result["error"]:
-                    return
-
-                all_flights = result["departures"] + result["arrivals"]
-                if not all_flights:
-                    return
-
-                disruptions = _count_disruptions(all_flights)
-                summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-                total_flights = summary["total_flights"]
-                if total_flights > 0:
-                    disruption_pct = round((disruptions["total_disruptions"] / total_flights) * 100, 1)
-                    if disruption_pct >= disruption_threshold_pct:
-                        disrupted_airports.append({
-                            "icao": airport["icao"],
-                            "name": airport["name"],
-                            "city": airport["city"],
-                            "country": airport["country"],
-                            "disruption_pct": disruption_pct,
-                            **summary,
-                            **disruptions,
-                        })
-
-        tasks = [_fetch_with_limit(airport) for airport in airports_to_scan]
-        await asyncio.gather(*tasks)
-
-        # Sort results
-        if sort_by == "total_disruptions":
-            disrupted_airports.sort(key=lambda x: x["total_disruptions"], reverse=True)
-        elif sort_by == "disruption_pct":
-            disrupted_airports.sort(key=lambda x: x["disruption_pct"], reverse=True)
-        else:
-            disrupted_airports.sort(key=lambda x: x["disruption_pct"], reverse=True)  # default
-
-        return {
-            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-            "period": f"past {_days_back} days",
-            "provider": provider,
-            "disruption_threshold_pct": disruption_threshold_pct,
-            "sort_by": sort_by,
-            "airports_scanned": total_airports,
-            "airports_with_disruptions": len(disrupted_airports),
-            "disruptions": disrupted_airports,
-        }
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=600)  # Longer timeout for full scan
-    except asyncio.TimeoutError:
-        return {"error": "Query timed out after 600 seconds"}
-
-
-@mcp.tool()
-async def run_aviation_api_search(
-    disruption_threshold_pct: float = 25.0,
-    reduction_threshold_pct: float = 25.0,
-    test_mode: bool = False,
-    ctx: Context | None = None,
-) -> dict:
-    """Plan a comprehensive aviation API search across OpenSky, AeroDataBox, and AviationStack.
-
-    Returns a plan of individual tool calls to execute sequentially to check security triggers:
-    - Disruptions (cancelled/delayed flights) exceeding threshold
-    - Traffic reductions exceeding threshold
-    - Top airports by disruption impact
-
-    Execute the recommended tools one by one to avoid API rate limits.
-
-    Args:
-        disruption_threshold_pct: Minimum % of flights disrupted (default 25.0).
-        reduction_threshold_pct: Minimum % traffic reduction (default 25.0).
-        test_mode: If True, plan scans for major airports only (faster for testing).
-    """
-    async def _impl():
-        # Select airports to scan
-        if test_mode:
-            # Major African airports for testing
-            test_airports = [
-                "HKJK",  # Nairobi Jomo Kenyatta
-                "FAOR",  # Johannesburg OR Tambo
-                "DNMM",  # Lagos Murtala Muhammed
-                "HAAB",  # Addis Ababa Bole
-                "FIMP",  # Mauritius Sir Seewoosagur Ramgoolam
-                "DTTA",  # Tunis Carthage
-                "GMMN",  # Casablanca Mohammed V
-                "HECA",  # Cairo International
-                "DAAG",  # Algiers Houari Boumediene
-                "FNLU",  # Luanda Quatro de Fevereiro
-            ]
-            airports_to_scan = test_airports
-        else:
-            airports_to_scan = [a["icao"] for a in AFRICAN_AIRPORTS]
-
-        # Build plan of tool calls
-        plan = {
-            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-            "period": "past 3 days",
-            "triggers_to_check": [
-                f"Disruptions (cancelled/delayed flights) > {disruption_threshold_pct}%",
-                f"Traffic reductions > {reduction_threshold_pct}% over past 3 days",
-                "Top airports by disruption impact"
-            ],
-            "recommended_tool_calls": [],
-            "execution_order": "Run these tools sequentially, waiting 30-60 seconds between each to avoid rate limits."
-        }
-
-        # Disruption scans
-        if AVIATIONSTACK_API_KEY:
-            plan["recommended_tool_calls"].append({
-                "tool": "scan_african_airports_for_disruptions",
-                "description": f"Scan for disruptions using AviationStack (cancelled/delayed flights > {disruption_threshold_pct}%)",
-                "parameters": {
-                    "provider": "aviationstack",
-                    "disruption_threshold_pct": disruption_threshold_pct,
-                    "airport_list": airports_to_scan if test_mode else None
-                }
-            })
-
-        if AERODATA_API_KEY:
-            plan["recommended_tool_calls"].append({
-                "tool": "scan_african_airports_for_disruptions",
-                "description": f"Scan for disruptions using AeroDataBox (cancelled/delayed flights > {disruption_threshold_pct}%)",
-                "parameters": {
-                    "provider": "aerodatabox",
-                    "disruption_threshold_pct": disruption_threshold_pct,
-                    "airport_list": airports_to_scan if test_mode else None
-                }
-            })
-
-        # Reduction reports
-        if OPENSKY_USERNAME:
-            plan["recommended_tool_calls"].append({
-                "tool": "run_opensky_report",
-                "description": f"Check traffic reductions using OpenSky (> {reduction_threshold_pct}% reduction)",
-                "parameters": {
-                    "reduction_threshold_pct": reduction_threshold_pct
-                }
-            })
-
-        if AERODATA_API_KEY:
-            plan["recommended_tool_calls"].append({
-                "tool": "run_aerodatabox_report",
-                "description": f"Check traffic reductions using AeroDataBox (> {reduction_threshold_pct}% reduction)",
-                "parameters": {
-                    "reduction_threshold_pct": reduction_threshold_pct
-                }
-            })
-
-        if AVIATIONSTACK_API_KEY:
-            plan["recommended_tool_calls"].append({
-                "tool": "run_aviationstack_report",
-                "description": f"Check traffic reductions using AviationStack (> {reduction_threshold_pct}% reduction)",
-                "parameters": {
-                    "reduction_threshold_pct": reduction_threshold_pct
-                }
-            })
-
-        return plan
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=10)  # Fast response
-    except asyncio.TimeoutError:
-        return {"error": "Planning timed out"}
+    return {
+        "error": "Data not yet available",
+        "message": "Disruption data is refreshed daily. Please try again later.",
+        "next_refresh": "Data refreshes daily at midnight UTC",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1481,5 +1149,37 @@ async def test_connectivity() -> dict:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Daily cache scheduler — runs fetch_and_cache.main() at 02:00 UTC (06:00 ABT)
+# ---------------------------------------------------------------------------
+
+async def _daily_cache_loop() -> None:
+    import fetch_and_cache
+    while True:
+        now = datetime.now(timezone.utc)
+        next_run = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        delay = (next_run - now).total_seconds()
+        logging.info("Cache refresh scheduled in %.0f s (at %s UTC / 04:00 Morocco summer)", delay, next_run.strftime("%Y-%m-%d %H:%M"))
+        await asyncio.sleep(delay)
+        try:
+            await fetch_and_cache.main()
+        except Exception as exc:
+            logging.error("Daily cache refresh failed: %s", exc)
+
+
 if __name__ == "__main__":
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(server):
+        task = asyncio.create_task(_daily_cache_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    mcp.settings.lifespan = lifespan
     mcp.run(transport="streamable-http")

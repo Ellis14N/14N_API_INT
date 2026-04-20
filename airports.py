@@ -263,23 +263,42 @@ AFRICAN_AIRPORTS: list[dict] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Lookup helpers
-# ---------------------------------------------------------------------------
+# Major African airports by passenger traffic (top ~30)
+MAJOR_AFRICAN_AIRPORTS: list[dict] = [
+    {"icao": "FAOR", "name": "O.R. Tambo International Airport", "city": "Johannesburg", "country": "South Africa"},
+    {"icao": "HECA", "name": "Cairo International Airport", "city": "Cairo", "country": "Egypt"},
+    {"icao": "DNMM", "name": "Murtala Muhammed International Airport", "city": "Lagos", "country": "Nigeria"},
+    {"icao": "HKJK", "name": "Jomo Kenyatta International Airport", "city": "Nairobi", "country": "Kenya"},
+    {"icao": "HAAB", "name": "Addis Ababa Bole International Airport", "city": "Addis Ababa", "country": "Ethiopia"},
+    {"icao": "FACT", "name": "Cape Town International Airport", "city": "Cape Town", "country": "South Africa"},
+    {"icao": "GMMN", "name": "Mohammed V International Airport", "city": "Casablanca", "country": "Morocco"},
+    {"icao": "DAAG", "name": "Houari Boumediene Airport", "city": "Algiers", "country": "Algeria"},
+    {"icao": "DTTA", "name": "Tunis Carthage International Airport", "city": "Tunis", "country": "Tunisia"},
+    {"icao": "FALE", "name": "King Shaka International Airport", "city": "Durban", "country": "South Africa"},
+    {"icao": "DGAA", "name": "Kotoka International Airport", "city": "Accra", "country": "Ghana"},
+    {"icao": "GOOY", "name": "Leopold Sedar Senghor International Airport", "city": "Dakar", "country": "Senegal"},
+    {"icao": "FNLU", "name": "Quatro de Fevereiro Airport", "city": "Luanda", "country": "Angola"},
+    {"icao": "HSSS", "name": "Khartoum International Airport", "city": "Khartoum", "country": "Sudan"},
+    {"icao": "HTDA", "name": "Julius Nyerere International Airport", "city": "Dar es Salaam", "country": "Tanzania"},
+    {"icao": "HUEN", "name": "Entebbe International Airport", "city": "Entebbe", "country": "Uganda"},
+    {"icao": "FKKD", "name": "Douala International Airport", "city": "Douala", "country": "Cameroon"},
+    {"icao": "DIAP", "name": "Felix Houphouet Boigny International Airport", "city": "Abidjan", "country": "Ivory Coast"},
+    {"icao": "FQMA", "name": "Maputo International Airport", "city": "Maputo", "country": "Mozambique"},
+    {"icao": "FVHA", "name": "Robert Gabriel Mugabe International Airport", "city": "Harare", "country": "Zimbabwe"},
+    {"icao": "FZAA", "name": "N'Djili Airport", "city": "Kinshasa", "country": "Democratic Republic of the Congo"},
+    {"icao": "FOOL", "name": "Léon-Mba International Airport", "city": "Libreville", "country": "Gabon"},
+    {"icao": "DNPO", "name": "Port Harcourt International Airport", "city": "Port Harcourt", "country": "Nigeria"},
+    {"icao": "GABS", "name": "Modibo Keita International Airport", "city": "Bamako", "country": "Mali"},
+    {"icao": "DFFD", "name": "Thomas Sankara International Airport", "city": "Ouagadougou", "country": "Burkina Faso"},
+    {"icao": "GUCY", "name": "Conakry International Airport", "city": "Conakry", "country": "Guinea"},
+    {"icao": "GLRB", "name": "Roberts International Airport", "city": "Monrovia", "country": "Liberia"},
+    {"icao": "GFLL", "name": "Lungi International Airport", "city": "Freetown", "country": "Sierra Leone"},
+    {"icao": "HDAM", "name": "Djibouti-Ambouli International Airport", "city": "Djibouti", "country": "Djibouti"},
+    {"icao": "FMMI", "name": "Ivato International Airport", "city": "Antananarivo", "country": "Madagascar"},
+]
 
-# ICAO code → airport dict
 AIRPORT_BY_ICAO: dict[str, dict] = {a["icao"]: a for a in AFRICAN_AIRPORTS}
-
-# Country → list of airport dicts
-AIRPORTS_BY_COUNTRY: dict[str, list[dict]] = {}
-for _a in AFRICAN_AIRPORTS:
-    AIRPORTS_BY_COUNTRY.setdefault(_a["country"], []).append(_a)
-
-
-def get_airports_for_country(country: str) -> list[dict]:
-    """Return all airports for a given country (exact ACLED name)."""
-    return AIRPORTS_BY_COUNTRY.get(country, [])
 
 
 def get_airport(icao: str) -> dict | None:
-    """Return airport details for a given ICAO code."""
     return AIRPORT_BY_ICAO.get(icao.upper())
