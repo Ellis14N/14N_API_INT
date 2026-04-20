@@ -552,6 +552,23 @@ async def run_travel_advisories_report() -> dict:
 
     new_advisories.sort(key=lambda x: x["current_level"], reverse=True)
 
+    # Build full current snapshot for all 54 countries
+    all_countries_current = {}
+    for country, today_sources in today_data.items():
+        country_levels = {}
+        for src in sources:
+            today_src = today_sources.get(src, {})
+            if today_src.get("error") or today_src.get("level") is None:
+                country_levels[source_labels[src]] = "unavailable"
+            else:
+                country_levels[source_labels[src]] = {
+                    "level": today_src.get("level"),
+                    "level_text": today_src.get("level_text"),
+                    "primary_driver": today_src.get("primary_driver"),
+                    "url": today_src.get("url"),
+                }
+        all_countries_current[country] = country_levels
+
     return {
         "report_date": today_str,
         "compared_to": yesterday_str if yesterday_data else "no prior data",
@@ -561,6 +578,7 @@ async def run_travel_advisories_report() -> dict:
             f"{len(new_advisories)} new or elevated advisory/advisories issued since yesterday."
             if new_advisories else "No new travel advisories issued since yesterday."
         ),
+        "all_countries_current_levels": all_countries_current,
     }
 
 
