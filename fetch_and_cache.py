@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Daily cron job: fetch aviation data from all three APIs and write cache files.
+Daily cron job: fetch aviation data and write cache files.
 MCP tools read from these files and return instantly, staying under the 60s timeout.
 
 Cache files written (CACHE_DIR, named by UTC date):
-  traffic_reductions_YYYY-MM-DD.json   — airports where volume dropped >25% (OpenSky, AeroDataBox, AviationStack)
-  aviation_disruptions_YYYY-MM-DD.json — airports with cancelled/delayed flights (AeroDataBox, AviationStack only;
+  traffic_reductions_YYYY-MM-DD.json   — airports where volume dropped >25% (OpenSky, AeroDataBox)
+  aviation_disruptions_YYYY-MM-DD.json — airports with cancelled/delayed flights (AeroDataBox only;
                                          OpenSky does not expose flight status fields)
 """
 import asyncio
@@ -27,18 +27,15 @@ from airports import AFRICAN_AIRPORTS, MAJOR_AFRICAN_AIRPORTS
 from server import (
     _fetch_opensky_airport,
     _fetch_aerodatabox_airport,
-    _fetch_aviationstack_airport,
     _summarise_flights,
     OPENSKY_USERNAME,
     AERODATA_API_KEY,
-    AVIATIONSTACK_API_KEY,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 CACHE_DIR = Path("/data/cache") if os.path.exists("/data") else Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
-TOP_N = 20
 
 
 def _today() -> str:
@@ -78,36 +75,31 @@ async def _scan_airports(fetch_fn, airports: list[dict], begin_ts: int, end_ts: 
 # ---------------------------------------------------------------------------
 
 def _build_reduction_report(pairs: list[tuple[dict, dict]], begin_ts: int, end_ts: int) -> dict:
-    above_threshold = []
-    all_airports = []
+    flagged = []
 
     for airport_data, result in pairs:
         if result.get("error"):
             continue
         summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-        if not summary["operating"] or summary["reduction_pct"] is None:
+        if not summary["operating"] or summary["reduction_pct"] is None or summary["reduction_pct"] < 25.0:
             continue
-        entry = {
+        flagged.append({
             "icao": airport_data["icao"],
             "name": airport_data["name"],
             "city": airport_data["city"],
             "country": airport_data["country"],
-            **summary,
-        }
-        all_airports.append(entry)
-        if summary["reduction_pct"] >= 25.0:
-            above_threshold.append(entry)
+            "total_flights": summary["total_flights"],
+            "reduction_pct": summary["reduction_pct"],
+        })
 
-    above_threshold.sort(key=lambda x: x["reduction_pct"], reverse=True)
-    top_by_reduction = sorted(all_airports, key=lambda x: x["reduction_pct"], reverse=True)[:TOP_N]
+    flagged.sort(key=lambda x: x["reduction_pct"], reverse=True)
 
     return {
         "report_date": _today(),
         "period": "past 3 days",
         "airports_checked": len(pairs),
-        "airports_above_threshold": len(above_threshold),
-        "above_25pct_reduction": above_threshold,
-        "top_by_reduction_pct": top_by_reduction,
+        "airports_flagged": len(flagged),
+        "flagged": flagged,
     }
 
 
@@ -132,25 +124,16 @@ async def cache_traffic_reductions() -> None:
         except Exception as e:
             logging.error("AeroDataBox reductions failed: %s", e)
 
-    if AVIATIONSTACK_API_KEY:
-        try:
-            pairs = await _scan_airports(_fetch_aviationstack_airport, MAJOR_AFRICAN_AIRPORTS, begin_ts, end_ts, concurrency=2)
-            reports["aviationstack"] = _build_reduction_report(pairs, begin_ts, end_ts)
-            logging.info("AviationStack: %d airports above threshold", reports["aviationstack"]["airports_above_threshold"])
-        except Exception as e:
-            logging.error("AviationStack reductions failed: %s", e)
-
     _write_cache("traffic_reductions", reports)
 
 
 # ---------------------------------------------------------------------------
-# Disruptions — cancelled / delayed flights (AeroDataBox + AviationStack only;
+# Disruptions — cancelled / delayed flights (AeroDataBox only;
 # OpenSky does not expose flight status fields)
 # ---------------------------------------------------------------------------
 
 def _build_disruption_report(pairs: list[tuple[dict, dict]]) -> dict:
-    above_threshold = []
-    all_disrupted = []
+    flagged = []
 
     for airport_data, result in pairs:
         if result.get("error"):
@@ -162,10 +145,10 @@ def _build_disruption_report(pairs: list[tuple[dict, dict]]) -> dict:
         cancelled = sum(1 for f in all_flights if "cancel" in (f.get("status") or "").lower())
         delayed = sum(1 for f in all_flights if "delay" in (f.get("status") or "").lower())
         disrupted = cancelled + delayed
-        if disrupted == 0:
-            continue
         disruption_pct = round(disrupted / total * 100, 1)
-        entry = {
+        if disruption_pct < 25.0:
+            continue
+        flagged.append({
             "icao": airport_data["icao"],
             "name": airport_data["name"],
             "city": airport_data["city"],
@@ -173,25 +156,17 @@ def _build_disruption_report(pairs: list[tuple[dict, dict]]) -> dict:
             "total_flights": total,
             "cancelled": cancelled,
             "delayed": delayed,
-            "total_disruptions": disrupted,
             "disruption_pct": disruption_pct,
-        }
-        all_disrupted.append(entry)
-        if disruption_pct >= 25.0:
-            above_threshold.append(entry)
+        })
 
-    above_threshold.sort(key=lambda x: x["disruption_pct"], reverse=True)
-    top_by_count = sorted(all_disrupted, key=lambda x: x["total_disruptions"], reverse=True)[:TOP_N]
-    top_by_pct = sorted(all_disrupted, key=lambda x: x["disruption_pct"], reverse=True)[:TOP_N]
+    flagged.sort(key=lambda x: x["disruption_pct"], reverse=True)
 
     return {
         "report_date": _today(),
         "period": "past 3 days",
         "airports_checked": len(pairs),
-        "airports_above_threshold": len(above_threshold),
-        "above_25pct_disruption": above_threshold,
-        "top_by_disruption_count": top_by_count,
-        "top_by_disruption_pct": top_by_pct,
+        "airports_flagged": len(flagged),
+        "flagged": flagged,
     }
 
 
@@ -207,14 +182,6 @@ async def cache_aviation_disruptions() -> None:
             logging.info("AeroDataBox disruptions: %d above threshold", reports["aerodatabox"]["airports_above_threshold"])
         except Exception as e:
             logging.error("AeroDataBox disruptions failed: %s", e)
-
-    if AVIATIONSTACK_API_KEY:
-        try:
-            pairs = await _scan_airports(_fetch_aviationstack_airport, MAJOR_AFRICAN_AIRPORTS, begin_ts, end_ts, concurrency=2)
-            reports["aviationstack"] = _build_disruption_report(pairs)
-            logging.info("AviationStack disruptions: %d above threshold", reports["aviationstack"]["airports_above_threshold"])
-        except Exception as e:
-            logging.error("AviationStack disruptions failed: %s", e)
 
     _write_cache("aviation_disruptions", reports)
 

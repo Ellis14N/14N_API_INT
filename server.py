@@ -45,9 +45,6 @@ AERODATA_API_URL = "https://aerodatabox.p.rapidapi.com"
 AERODATA_API_HOST = "aerodatabox.p.rapidapi.com"
 AERODATA_API_KEY = os.getenv("AERODATA_API_KEY", "")
 
-AVIATIONSTACK_API_URL = "https://api.aviationstack.com/v1"
-AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY", "")
-
 DIPLOMATIC_KEYWORDS = [
     "embassy", "embassies", "consulate", "consular", "diplomatic",
     "ambassador", "high commission", "chancellery",
@@ -794,78 +791,6 @@ async def _fetch_aerodatabox_airport(
     return results
 
 
-async def _fetch_aviationstack_airport(
-    client: httpx.AsyncClient,
-    icao: str,
-    begin: int,
-    end: int,
-    on_chunk_done: object = None,
-) -> dict:
-    results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
-    iata = _get_iata_for_icao(icao)
-    if not iata:
-        results["error"] = f"Missing IATA code for ICAO {icao}"
-        return results
-
-    while begin < end:
-        date_str = datetime.utcfromtimestamp(begin).strftime("%Y-%m-%d")
-        for direction, collection in (("dep_iata", "departures"), ("arr_iata", "arrivals")):
-            offset = 0
-            limit = 1000
-            while True:
-                try:
-                    resp = await client.get(
-                        f"{AVIATIONSTACK_API_URL}/flights",
-                        params={
-                            "access_key": AVIATIONSTACK_API_KEY,
-                            direction: iata,
-                            "flight_date": date_str,
-                            "limit": limit,
-                            "offset": offset,
-                        },
-                        timeout=60,
-                    )
-                except Exception as e:
-                    results["error"] = str(e)
-                    logging.error("AviationStack fetch error for %s (%s): %s", icao, direction, e)
-                    return results
-
-                if resp.status_code == 200:
-                    payload = resp.json() or {}
-                    data = payload.get("data", []) or []
-                    results[collection].extend(data)
-
-                    pagination = payload.get("pagination", {})
-                    count = pagination.get("count", len(data))
-                    total = pagination.get("total", offset + count)
-                    offset += count
-                    if count == 0 or offset >= total:
-                        break
-                    await asyncio.sleep(0.25)
-                    continue
-                elif resp.status_code == 429:
-                    delay = int(resp.headers.get("Retry-After", "2"))
-                    await asyncio.sleep(max(delay, 1))
-                    continue
-                elif resp.status_code == 403:
-                    results["error"] = "AviationStack API access restricted for this key"
-                    logging.warning("AviationStack access restricted for %s: %s", icao, resp.text[:200])
-                    return results
-                elif resp.status_code == 404:
-                    logging.warning("AviationStack %s %s -> %s", icao, direction, resp.status_code)
-                    break
-                else:
-                    logging.warning("AviationStack %s %s -> %s", icao, direction, resp.status_code)
-                    break
-
-        if on_chunk_done:
-            await on_chunk_done()
-        begin += 86400
-        await asyncio.sleep(0.25)
-
-    return results
-
-
 @mcp.tool()
 async def fetch_airport_activity_aerodata(
     airport_icao: str,
@@ -900,58 +825,6 @@ async def fetch_airport_activity_aerodata(
 
         async with httpx.AsyncClient(timeout=180) as client:
             result = await _fetch_aerodatabox_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
-
-        if ctx:
-            await ctx.report_progress(3, 3, "Summarising results...")
-
-        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-        return {
-            "airport": airport,
-            "period_days": _days_back,
-            **summary,
-            "error": result["error"],
-        }
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=300)
-    except asyncio.TimeoutError:
-        return {"error": "Query timed out after 300 seconds"}
-
-
-@mcp.tool()
-async def fetch_airport_activity_aviationstack(
-    airport_icao: str,
-    days_back: int = 3,
-    ctx: Context | None = None,
-) -> dict:
-    """Fetch departures and arrivals for a specific African airport using AviationStack."""
-    if not AVIATIONSTACK_API_KEY:
-        return {"error": "AVIATIONSTACK_API_KEY is not configured."}
-
-    async def _impl():
-        _days_back = min(max(days_back, 1), 3)
-        icao = airport_icao.upper().strip()
-        airport = get_airport(icao)
-        if airport is None:
-            return {"error": f"Airport '{icao}' not found in African airport database."}
-
-        if ctx:
-            await ctx.report_progress(0, 3, f"Querying AviationStack for {icao}...")
-
-        now_utc = datetime.now(timezone.utc)
-        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        begin_ts = end_ts - (_days_back * 86400)
-
-        chunk_count = [0]
-        total_chunks = _days_back
-
-        async def _ping():
-            chunk_count[0] += 1
-            if ctx:
-                await ctx.report_progress(chunk_count[0], total_chunks, f"Fetching {icao} day {chunk_count[0]}/{total_chunks}")
-
-        async with httpx.AsyncClient(timeout=180) as client:
-            result = await _fetch_aviationstack_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
 
         if ctx:
             await ctx.report_progress(3, 3, "Summarising results...")
@@ -1006,49 +879,11 @@ async def run_aerodatabox_report(
 
 
 @mcp.tool()
-async def run_aviationstack_report(
-    reduction_threshold_pct: float = 25.0,
-    ctx: Context | None = None,
-) -> dict:
-    """Return today's cached AviationStack traffic reduction report across African airports (past 3 days).
-
-    Returns airports where flight volume dropped >25%, plus top 20 by reduction percentage.
-    Data is refreshed daily by the cron job.
-    """
-    if not AVIATIONSTACK_API_KEY:
-        return {"error": "AVIATIONSTACK_API_KEY is not configured."}
-
-    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
-    cache_file = cache_dir / f"traffic_reductions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
-
-    if cache_file.exists():
-        try:
-            with open(cache_file, "r") as f:
-                cached_data = json.load(f)
-            if "aviationstack" in cached_data["data"]:
-                return cached_data["data"]["aviationstack"]
-        except Exception as e:
-            print(f"Cache read failed: {e}")
-
-    return {
-        "error": "Data not yet available",
-        "message": "Traffic reduction data is being refreshed. Please try again in a few minutes.",
-        "next_refresh": "Data refreshes daily at midnight UTC",
-        "cache_file_checked": str(cache_file),
-    }
-
-
-@mcp.tool()
 async def scan_african_airports_for_disruptions() -> dict:
     """Return today's cached aviation disruption report across African airports (past 3 days).
 
-    Per provider (AeroDataBox, AviationStack) returns:
-      - above_25pct_disruption: airports where cancelled+delayed > 25% of flights
-      - top_by_disruption_count: top 20 airports by total disrupted flights
-      - top_by_disruption_pct: top 20 airports by disruption percentage
-
-    Note: OpenSky does not expose flight status fields so is excluded from disruption data.
-    Data is refreshed daily by the cron job.
+    Returns airports where cancelled+delayed flights exceed 25%, plus top 20 by count and percentage.
+    Data is refreshed daily by the cron job. Source: AeroDataBox.
     """
     cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
     cache_file = cache_dir / f"aviation_disruptions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
@@ -1083,7 +918,6 @@ async def test_connectivity() -> dict:
         "opensky_username_set": bool(OPENSKY_USERNAME),
         "opensky_password_set": bool(OPENSKY_PASSWORD),
         "aerodatabox_api_key_set": bool(AERODATA_API_KEY),
-        "aviationstack_api_key_set": bool(AVIATIONSTACK_API_KEY),
     }
 
     # Test ACLED token endpoint
@@ -1131,23 +965,6 @@ async def test_connectivity() -> dict:
                 results["aerodatabox_body"] = resp.text[:500]
         except Exception as exc:
             results["aerodatabox_error"] = str(exc)
-
-    if AVIATIONSTACK_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    f"{AVIATIONSTACK_API_URL}/flights",
-                    params={
-                        "access_key": AVIATIONSTACK_API_KEY,
-                        "dep_iata": "NBO",
-                        "flight_date": datetime.utcnow().strftime("%Y-%m-%d"),
-                        "limit": 1,
-                    },
-                )
-                results["aviationstack_status"] = resp.status_code
-                results["aviationstack_body"] = resp.text[:500]
-        except Exception as exc:
-            results["aviationstack_error"] = str(exc)
 
     # Test basic DNS / outbound connectivity
     try:
