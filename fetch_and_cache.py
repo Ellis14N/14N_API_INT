@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from airports import AFRICAN_AIRPORTS, MAJOR_AFRICAN_AIRPORTS
+from countries import ACLED_NAMES
 from server import (
     _fetch_opensky_airport,
     _fetch_aerodatabox_airport,
@@ -31,6 +32,7 @@ from server import (
     OPENSKY_USERNAME,
     AERODATA_API_KEY,
 )
+from travel_advisories import fetch_advisories_for_countries
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -188,10 +190,21 @@ async def cache_aviation_disruptions() -> None:
 
 # ---------------------------------------------------------------------------
 
+async def cache_travel_advisories() -> None:
+    logging.info("Caching travel advisories for %d countries...", len(ACLED_NAMES))
+    try:
+        data = await fetch_advisories_for_countries(ACLED_NAMES)
+        _write_cache("travel_advisories", data)
+        logging.info("Travel advisories cached: %d countries", len(data))
+    except Exception as e:
+        logging.error("Travel advisories cache failed: %s", e)
+
+
 async def main() -> None:
-    logging.info("Starting daily aviation cache refresh")
+    logging.info("Starting daily cache refresh")
     await cache_traffic_reductions()
     await cache_aviation_disruptions()
+    await cache_travel_advisories()
     logging.info("Cache refresh complete")
 
 

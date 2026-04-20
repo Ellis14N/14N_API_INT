@@ -28,6 +28,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from countries import ACLED_NAMES, resolve_country
 from airports import AFRICAN_AIRPORTS, get_airport
 from icao_iata import ICAO_TO_IATA
+from travel_advisories import fetch_all_advisories
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -899,6 +900,105 @@ async def scan_african_airports_for_disruptions() -> dict:
         "error": "Data not yet available",
         "message": "Disruption data is refreshed daily. Please try again later.",
         "next_refresh": "Data refreshes daily at midnight UTC",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Travel advisories
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def fetch_travel_advisories(country: str) -> dict:
+    """Fetch live travel advisories for a specific country from UK FCDO, US State Department, Australian DFAT, and French MEAE.
+
+    Use this when you need the current advisory for a single country on demand.
+
+    Args:
+        country: Country name (e.g. "Mali", "Somalia", "Democratic Republic of the Congo").
+    """
+    try:
+        return await asyncio.wait_for(fetch_all_advisories(country), timeout=45)
+    except asyncio.TimeoutError:
+        return {"error": "Advisory fetch timed out after 45 seconds"}
+
+
+@mcp.tool()
+async def run_travel_advisories_report() -> dict:
+    """Check whether any new travel advisories have been issued for African countries since yesterday.
+
+    Compares today's cached advisory levels against yesterday's across all 54 African countries
+    and all four sources (UK FCDO, US State Department, Australian DFAT, French MEAE).
+    Only returns countries where a level has increased. If nothing changed, says so.
+    Data is refreshed daily by the cron job.
+    """
+    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    today_file = cache_dir / f"travel_advisories_{today_str}.json"
+    yesterday_file = cache_dir / f"travel_advisories_{yesterday_str}.json"
+
+    if not today_file.exists():
+        return {
+            "error": "Data not yet available",
+            "message": "Travel advisory data is refreshed daily. Please try again later.",
+        }
+
+    try:
+        with open(today_file) as f:
+            today_data: dict = json.load(f)["data"]
+    except Exception as e:
+        return {"error": f"Cache read failed: {e}"}
+
+    yesterday_data: dict = {}
+    if yesterday_file.exists():
+        try:
+            with open(yesterday_file) as f:
+                yesterday_data = json.load(f)["data"]
+        except Exception:
+            pass
+
+    sources = ("fcdo", "us_state_dept", "aus_dfat", "french_meae")
+    source_labels = {
+        "fcdo": "UK FCDO",
+        "us_state_dept": "US State Department",
+        "aus_dfat": "Australian DFAT",
+        "french_meae": "French MEAE",
+    }
+
+    new_advisories = []
+    for country, today_sources in today_data.items():
+        yesterday_sources = yesterday_data.get(country, {})
+        for src in sources:
+            today_src = today_sources.get(src, {})
+            if today_src.get("error") or today_src.get("level") is None:
+                continue
+            today_level = int(today_src.get("level") or 0)
+            yesterday_level = int((yesterday_sources.get(src) or {}).get("level") or 0)
+            if today_level > yesterday_level:
+                new_advisories.append({
+                    "country": country,
+                    "source": source_labels[src],
+                    "previous_level": yesterday_level,
+                    "current_level": today_level,
+                    "level_text": today_src.get("level_text"),
+                    "advisory": today_src.get("advisory"),
+                    "primary_driver": today_src.get("primary_driver"),
+                    "updated_at": today_src.get("updated_at"),
+                    "url": today_src.get("url"),
+                })
+
+    new_advisories.sort(key=lambda x: x["current_level"], reverse=True)
+
+    return {
+        "report_date": today_str,
+        "compared_to": yesterday_str if yesterday_data else "no prior data",
+        "new_advisories_count": len(new_advisories),
+        "new_advisories": new_advisories,
+        "summary": (
+            f"{len(new_advisories)} new or elevated advisory/advisories issued since yesterday."
+            if new_advisories else "No new travel advisories issued since yesterday."
+        ),
     }
 
 
