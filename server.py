@@ -492,31 +492,35 @@ async def fetch_travel_advisories(country: str) -> dict:
 
 @mcp.tool()
 async def run_travel_advisories_report() -> dict:
-    """Check whether any new travel advisories have been issued for African countries since yesterday.
+    """Fetch live travel advisories for all 54 African countries and report any new or elevated advisories since yesterday.
 
-    Compares today's cached advisory levels against yesterday's across all 54 African countries
-    and all four sources (UK FCDO, US State Department, Australian DFAT, French MEAE).
-    Only returns countries where a level has increased. If nothing changed, says so.
-    Data is refreshed daily by the cron job.
+    Fetches current data live from UK FCDO, US State Department, Australian DFAT, and French MEAE,
+    then compares against yesterday's snapshot to surface level increases.
     """
+    from travel_advisories import fetch_advisories_for_countries
+
     cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
+    cache_dir.mkdir(exist_ok=True)
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    today_file = cache_dir / f"travel_advisories_{today_str}.json"
     yesterday_file = cache_dir / f"travel_advisories_{yesterday_str}.json"
 
-    if not today_file.exists():
-        return {
-            "error": "Data not yet available",
-            "message": "Travel advisory data is refreshed daily. Please try again later.",
-        }
-
     try:
-        with open(today_file) as f:
-            today_data: dict = json.load(f)["data"]
+        today_data: dict = await asyncio.wait_for(
+            fetch_advisories_for_countries(ACLED_NAMES), timeout=120
+        )
+    except asyncio.TimeoutError:
+        return {"error": "Live fetch timed out after 120 seconds"}
     except Exception as e:
-        return {"error": f"Cache read failed: {e}"}
+        return {"error": f"Live fetch failed: {e}"}
+
+    # Write today's result to cache for tomorrow's diff
+    try:
+        today_file = cache_dir / f"travel_advisories_{today_str}.json"
+        with open(today_file, "w") as f:
+            json.dump({"timestamp": datetime.utcnow().isoformat(), "data": today_data}, f)
+    except Exception as e:
+        logging.warning("Could not write travel advisory cache: %s", e)
 
     yesterday_data: dict = {}
     if yesterday_file.exists():

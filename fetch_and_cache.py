@@ -4,8 +4,9 @@ Daily cron job: fetch data and write cache files.
 MCP tools read from these files and return instantly, staying under the 60s timeout.
 
 Cache files written (CACHE_DIR, named by UTC date):
-  acled_conflicts_YYYY-MM-DD.json    — ACLED trigger report for all 54 African countries
-  travel_advisories_YYYY-MM-DD.json — advisory levels for all 54 African countries
+  acled_conflicts_YYYY-MM-DD.json — ACLED trigger report for all 54 African countries
+
+Note: travel advisories are fetched live on demand by run_travel_advisories_report().
 """
 import asyncio
 import json
@@ -26,7 +27,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from countries import ACLED_NAMES
-from travel_advisories import fetch_advisories_for_countries
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -239,24 +239,9 @@ async def cache_acled_report() -> None:
         logging.error("ACLED cache failed: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# Travel advisories
-# ---------------------------------------------------------------------------
-
-async def cache_travel_advisories() -> None:
-    logging.info("Caching travel advisories for %d countries...", len(ACLED_NAMES))
-    try:
-        data = await fetch_advisories_for_countries(ACLED_NAMES)
-        _write_cache("travel_advisories", data)
-        logging.info("Travel advisories cached: %d countries", len(data))
-    except Exception as e:
-        logging.error("Travel advisories cache failed: %s", e)
-
-
 async def main() -> None:
     logging.info("Starting daily cache refresh")
     await cache_acled_report()
-    await cache_travel_advisories()
     logging.info("Cache refresh complete")
 
 
