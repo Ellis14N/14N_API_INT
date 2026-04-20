@@ -1169,17 +1169,19 @@ async def run_aviationstack_report(
 async def scan_african_airports_for_disruptions(
     provider: str = "aviationstack",
     days_back: int = 3,
-    disruption_threshold_pct: float = 10.0,
+    disruption_threshold_pct: float = 25.0,
     sort_by: str = "disruption_pct",
+    airport_list: list[str] | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Scan all African airports for flight disruptions (cancelled or delayed flights) exceeding a threshold.
+    """Scan African airports for flight disruptions (cancelled or delayed flights) exceeding a threshold.
 
     Args:
         provider: Data provider to use ('aviationstack' or 'aerodatabox').
         days_back: Number of days to look back (default 3).
-        disruption_threshold_pct: Minimum % of flights that must be disrupted (default 10.0).
+        disruption_threshold_pct: Minimum % of flights that must be disrupted (default 25.0).
         sort_by: Sort results by 'disruption_pct' or 'total_disruptions' (default 'disruption_pct').
+        airport_list: Optional list of ICAO codes to scan (default all African airports).
     """
     if provider not in ("aviationstack", "aerodatabox"):
         return {"error": f"Unsupported provider: {provider}. Use 'aviationstack' or 'aerodatabox'."}
@@ -1195,7 +1197,13 @@ async def scan_african_airports_for_disruptions(
         end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         begin_ts = end_ts - (_days_back * 86400)
 
-        total_airports = len(AFRICAN_AIRPORTS)
+        # Select airports to scan
+        if airport_list:
+            airports_to_scan = [a for a in AFRICAN_AIRPORTS if a["icao"] in airport_list]
+        else:
+            airports_to_scan = AFRICAN_AIRPORTS
+
+        total_airports = len(airports_to_scan)
         completed = [0]
         sem = asyncio.Semaphore(2 if provider == "aviationstack" else 3)
 
@@ -1239,7 +1247,7 @@ async def scan_african_airports_for_disruptions(
                             **disruptions,
                         })
 
-        tasks = [_fetch_with_limit(airport) for airport in AFRICAN_AIRPORTS]
+        tasks = [_fetch_with_limit(airport) for airport in airports_to_scan]
         await asyncio.gather(*tasks)
 
         # Sort results
@@ -1265,6 +1273,119 @@ async def scan_african_airports_for_disruptions(
         return await asyncio.wait_for(_impl(), timeout=600)  # Longer timeout for full scan
     except asyncio.TimeoutError:
         return {"error": "Query timed out after 600 seconds"}
+
+
+@mcp.tool()
+async def run_aviation_api_search(
+    disruption_threshold_pct: float = 25.0,
+    reduction_threshold_pct: float = 25.0,
+    test_mode: bool = False,
+    ctx: Context | None = None,
+) -> dict:
+    """Plan a comprehensive aviation API search across OpenSky, AeroDataBox, and AviationStack.
+
+    Returns a plan of individual tool calls to execute sequentially to check security triggers:
+    - Disruptions (cancelled/delayed flights) exceeding threshold
+    - Traffic reductions exceeding threshold
+    - Top airports by disruption impact
+
+    Execute the recommended tools one by one to avoid API rate limits.
+
+    Args:
+        disruption_threshold_pct: Minimum % of flights disrupted (default 25.0).
+        reduction_threshold_pct: Minimum % traffic reduction (default 25.0).
+        test_mode: If True, plan scans for major airports only (faster for testing).
+    """
+    async def _impl():
+        # Select airports to scan
+        if test_mode:
+            # Major African airports for testing
+            test_airports = [
+                "HKJK",  # Nairobi Jomo Kenyatta
+                "FAOR",  # Johannesburg OR Tambo
+                "DNMM",  # Lagos Murtala Muhammed
+                "HAAB",  # Addis Ababa Bole
+                "FIMP",  # Mauritius Sir Seewoosagur Ramgoolam
+                "DTTA",  # Tunis Carthage
+                "GMMN",  # Casablanca Mohammed V
+                "HECA",  # Cairo International
+                "DAAG",  # Algiers Houari Boumediene
+                "FNLU",  # Luanda Quatro de Fevereiro
+            ]
+            airports_to_scan = test_airports
+        else:
+            airports_to_scan = [a["icao"] for a in AFRICAN_AIRPORTS]
+
+        # Build plan of tool calls
+        plan = {
+            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "period": "past 3 days",
+            "triggers_to_check": [
+                f"Disruptions (cancelled/delayed flights) > {disruption_threshold_pct}%",
+                f"Traffic reductions > {reduction_threshold_pct}% over past 3 days",
+                "Top airports by disruption impact"
+            ],
+            "recommended_tool_calls": [],
+            "execution_order": "Run these tools sequentially, waiting 30-60 seconds between each to avoid rate limits."
+        }
+
+        # Disruption scans
+        if AVIATIONSTACK_API_KEY:
+            plan["recommended_tool_calls"].append({
+                "tool": "scan_african_airports_for_disruptions",
+                "description": f"Scan for disruptions using AviationStack (cancelled/delayed flights > {disruption_threshold_pct}%)",
+                "parameters": {
+                    "provider": "aviationstack",
+                    "disruption_threshold_pct": disruption_threshold_pct,
+                    "airport_list": airports_to_scan if test_mode else None
+                }
+            })
+
+        if AERODATA_API_KEY:
+            plan["recommended_tool_calls"].append({
+                "tool": "scan_african_airports_for_disruptions",
+                "description": f"Scan for disruptions using AeroDataBox (cancelled/delayed flights > {disruption_threshold_pct}%)",
+                "parameters": {
+                    "provider": "aerodatabox",
+                    "disruption_threshold_pct": disruption_threshold_pct,
+                    "airport_list": airports_to_scan if test_mode else None
+                }
+            })
+
+        # Reduction reports
+        if OPENSKY_USERNAME:
+            plan["recommended_tool_calls"].append({
+                "tool": "run_opensky_report",
+                "description": f"Check traffic reductions using OpenSky (> {reduction_threshold_pct}% reduction)",
+                "parameters": {
+                    "reduction_threshold_pct": reduction_threshold_pct
+                }
+            })
+
+        if AERODATA_API_KEY:
+            plan["recommended_tool_calls"].append({
+                "tool": "run_aerodatabox_report",
+                "description": f"Check traffic reductions using AeroDataBox (> {reduction_threshold_pct}% reduction)",
+                "parameters": {
+                    "reduction_threshold_pct": reduction_threshold_pct
+                }
+            })
+
+        if AVIATIONSTACK_API_KEY:
+            plan["recommended_tool_calls"].append({
+                "tool": "run_aviationstack_report",
+                "description": f"Check traffic reductions using AviationStack (> {reduction_threshold_pct}% reduction)",
+                "parameters": {
+                    "reduction_threshold_pct": reduction_threshold_pct
+                }
+            })
+
+        return plan
+
+    try:
+        return await asyncio.wait_for(_impl(), timeout=10)  # Fast response
+    except asyncio.TimeoutError:
+        return {"error": "Planning timed out"}
 
 
 # ---------------------------------------------------------------------------
