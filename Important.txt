@@ -2,12 +2,29 @@ To Do:
 
 1. ACLED API doesn't work due to a lack of permissions,
 2. Travel Advisories does not work for US or AUS,
-3. Explore UNHCR data for inclusion. 
-    - Data to show:
-        - Total number of Displaced Persons
-        - Displacement flow
-            (i.e., 22 origin countries -> Sudan | YoY Decreasing (-11.7%))
-        - 
+3. UNHCR data — COMPLETE.
+    - Total displaced per country (inflow + outflow)
+    - YoY trend (direction + %)
+    - Breakdown by type: Refugees, Asylum Seekers, IDPs, Stateless, OIP
+    - Top 5 inflow origins and outflow destinations with %
+    - Cached weekly (Mondays 02:00 UTC) via GitHub Actions
+
+3b. IDMC Sub-national Displacement Data — PENDING (requires API key from idmc.org)
+    - ADM1 level only (regions/provinces, no deeper)
+    - 28-day rolling window, two comparison periods:
+        - Most recent 7 days vs prior 7 days (weekly % change)
+        - Most recent 14 days vs prior 14 days (bi-weekly % change)
+    - Surface top 10 regions by new displacement volume
+        (top 5 increasing, top 5 decreasing)
+    - Conflict-triggered vs disaster-triggered classification
+    - Example output:
+        North Darfur, Sudan
+        New displacement (last 7 days): 12,400
+        vs prior 7 days: +340% ▲
+        vs prior 14 days: +180% ▲
+        Type: Conflict
+    - Cached weekly (Mondays, alongside UNHCR)
+    - TODO: Verify IDMC API supports date-range filtering and ADM1 location data
 4. Weather and Severe Event Data inclusion.
     - RCC ACMAD 10-Day Bulletin
     - GloFAS Flood Forecasting
