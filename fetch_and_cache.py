@@ -264,7 +264,11 @@ async def cache_travel_advisories() -> None:
         logging.error("Failed to fetch travel advisories: %s", e)
         advisories = {}
 
-    _write_cache("travel_advisories", advisories)
+    date_label = datetime.utcnow().strftime("%d-%m-%y")
+    path = CACHE_DIR / f"Travel Advisory {date_label}.json"
+    with open(path, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat(), "data": advisories}, f)
+    logging.info("Wrote %s", path)
     # Also write a 'latest' copy for quick access
     latest_path = CACHE_DIR / "travel_advisories_latest.json"
     try:

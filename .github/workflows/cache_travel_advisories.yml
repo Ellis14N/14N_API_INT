@@ -41,7 +41,7 @@ jobs:
 
           git checkout main -- cache/ 2>/dev/null || true
 
-          git add cache/travel_advisories_*.json
+          git add "cache/Travel Advisory "*.json
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: update travel advisories cache $(date -u +%Y-%m-%d)"
+          git commit -m "chore: update travel advisory cache $(date -u +%d-%m-%y)"
           git push origin data

@@ -499,17 +499,18 @@ async def run_travel_advisories_report() -> dict:
     and compares against yesterday's to surface any new or elevated advisories.
     """
     GITHUB_RAW = "https://raw.githubusercontent.com/Ellis14N/14N_API_INT/data/cache"
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
-    yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    now_utc = datetime.utcnow()
+    today_label = now_utc.strftime("%d-%m-%y")
+    yesterday_label = (now_utc - timedelta(days=1)).strftime("%d-%m-%y")
 
     # Load today's cache from GitHub data branch
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(f"{GITHUB_RAW}/travel_advisories_{today_str}.json")
+            resp = await client.get(f"{GITHUB_RAW}/Travel Advisory {today_label}.json")
         if resp.status_code == 404:
             return {
                 "error": "Data not yet available",
-                "message": f"Travel advisory cache for {today_str} has not been generated yet. It refreshes daily at 02:00 Morocco time. Try again later or trigger the workflow manually in GitHub Actions.",
+                "message": f"Travel advisory cache for {today_label} has not been generated yet. It refreshes daily at 02:00 Morocco time. Try again later or trigger the workflow manually in GitHub Actions.",
             }
         resp.raise_for_status()
         today_data: dict = resp.json()["data"]
@@ -520,7 +521,7 @@ async def run_travel_advisories_report() -> dict:
     yesterday_data: dict = {}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(f"{GITHUB_RAW}/travel_advisories_{yesterday_str}.json")
+            resp = await client.get(f"{GITHUB_RAW}/Travel Advisory {yesterday_label}.json")
         if resp.status_code == 200:
             yesterday_data = resp.json().get("data", {})
     except Exception as e:
@@ -576,8 +577,8 @@ async def run_travel_advisories_report() -> dict:
         all_countries_current[country] = country_levels
 
     return {
-        "report_date": today_str,
-        "compared_to": yesterday_str if yesterday_data else "no prior data",
+        "report_date": today_label,
+        "compared_to": yesterday_label if yesterday_data else "no prior data",
         "new_advisories_count": len(new_advisories),
         "new_advisories": new_advisories,
         "summary": (
