@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,23 +12,7 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 
-# ---------------------------------------------------------------------------
-# Timeout configuration
-# ---------------------------------------------------------------------------
-# Timeouts are intentionally generous to accommodate:
-#   - Concurrent requests to 54+ African airports via OpenSky (up to 300 s)
-#   - ACLED API responses that vary with data volume (up to 180 s)
-#   - Unpredictable network latency on external API calls
-# get_token:             60 s  — single auth POST, elevated from 30 s
-# fetch_acled_events:   180 s  — single-country ACLED query
-# run_africa_report:    180 s  — 54-country concurrent ACLED gather
-# fetch_airport_activity: 300 s — single-airport OpenSky query
-# run_opensky_report:   300 s  — all-airport concurrent OpenSky gather
-# ---------------------------------------------------------------------------
-
 from countries import ACLED_NAMES, resolve_country
-from airports import AFRICAN_AIRPORTS, get_airport
-from icao_iata import ICAO_TO_IATA
 from travel_advisories import fetch_all_advisories
 
 logging.basicConfig(level=logging.INFO)
@@ -37,14 +22,6 @@ ACLED_API_URL = "https://acleddata.com/api/acled/read"
 ACLED_TOKEN_URL = "https://acleddata.com/oauth/token"
 ACLED_USERNAME = os.getenv("ACLED_USERNAME", "")
 ACLED_PASSWORD = os.getenv("ACLED_PASSWORD", "")
-
-OPENSKY_API_URL = "https://opensky-network.org/api"
-OPENSKY_USERNAME = os.getenv("OPENSKY_USERNAME", "")
-OPENSKY_PASSWORD = os.getenv("OPENSKY_PASSWORD", "")
-
-AERODATA_API_URL = "https://aerodatabox.p.rapidapi.com"
-AERODATA_API_HOST = "aerodatabox.p.rapidapi.com"
-AERODATA_API_KEY = os.getenv("AERODATA_API_KEY", "")
 
 DIPLOMATIC_KEYWORDS = [
     "embassy", "embassies", "consulate", "consular", "diplomatic",
@@ -205,7 +182,6 @@ def _check_trigger_4(events: list[dict], capital: str) -> dict | None:
         if (e.get("event_type") or "").lower() in ("protests", "riots")
     ]
 
-    # Consecutive days in capital
     capital_dates = sorted({
         e["event_date"] for e in protest_events
         if capital.lower() in (e.get("location") or "").lower()
@@ -228,7 +204,6 @@ def _check_trigger_4(events: list[dict], capital: str) -> dict | None:
 
     capital_hit = max_streak >= 3
 
-    # Multi-city same day
     daily_cities: dict[str, set] = defaultdict(set)
     for e in protest_events:
         daily_cities[e["event_date"]].add(e.get("location", ""))
@@ -307,7 +282,7 @@ CAPITALS: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# MCP tools
+# ACLED tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -340,17 +315,12 @@ async def fetch_acled_events(
         }
         if event_type:
             params["event_type"] = event_type
-
-        logging.info("Calling ACLED API: %s %s", ACLED_API_URL, params)
         async with httpx.AsyncClient(timeout=180) as client:
             resp = await client.get(
                 ACLED_API_URL,
                 params=params,
                 headers={"Authorization": f"Bearer {token}"},
             )
-            logging.info("ACLED response status: %s", resp.status_code)
-            if resp.status_code != 200:
-                logging.error("ACLED error body: %s", resp.text)
             resp.raise_for_status()
             return resp.json()
 
@@ -372,20 +342,16 @@ async def run_africa_report(
     structured country-by-country report of all triggered alerts.
 
     Args:
-        facility_lat: Optional latitude of an operating facility for
-                      Trigger 2 (armed group proximity) checks.
-        facility_lon: Optional longitude of an operating facility for
-                      Trigger 2 (armed group proximity) checks.
+        facility_lat: Optional latitude of an operating facility for Trigger 2 checks.
+        facility_lon: Optional longitude of an operating facility for Trigger 2 checks.
     """
-    # Serve from cache when facility coords aren't specified (cached data has no facility filter)
     if facility_lat is None and facility_lon is None:
         cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
         cache_file = cache_dir / f"acled_conflicts_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
         if cache_file.exists():
             try:
                 with open(cache_file) as f:
-                    cached = json.load(f)
-                return cached["data"]
+                    return json.load(f)["data"]
             except Exception as e:
                 logging.warning("ACLED cache read failed: %s", e)
 
@@ -408,48 +374,35 @@ async def run_africa_report(
             await ctx.report_progress(1, 54, "Fetching data for 54 countries...")
 
         async with httpx.AsyncClient(timeout=180) as client:
-            tasks = [
+            results = await asyncio.gather(*[
                 _fetch_country(client, token, country, date_from_str, date_to_str)
                 for country in ACLED_NAMES
-            ]
-            results = await asyncio.gather(*tasks)
+            ])
 
         if ctx:
             await ctx.report_progress(50, 54, "Analysing triggers...")
 
         country_events: dict[str, list[dict]] = dict(zip(ACLED_NAMES, results))
-
         report: dict[str, dict] = {}
 
         for country, events in country_events.items():
             if not events:
                 continue
-
             alerts: dict = {}
 
-            # Trigger 1 — week-on-week escalation
             t1 = _check_trigger_1(events)
             if t1:
                 alerts["trigger_1_escalation"] = t1
-
-            # Trigger 2 — armed group proximity (only if coordinates provided)
             if facility_coords:
                 t2 = _check_trigger_2(events, facility_coords[0], facility_coords[1])
                 if t2:
                     alerts["trigger_2_armed_proximity"] = t2
-
-            # Trigger 3 — foreign national kidnappings
             t3 = _check_trigger_3(events)
             if t3:
                 alerts["trigger_3_kidnappings"] = t3
-
-            # Trigger 4 — sustained/multi-city protests
-            capital = CAPITALS.get(country, "")
-            t4 = _check_trigger_4(events, capital)
+            t4 = _check_trigger_4(events, CAPITALS.get(country, ""))
             if t4:
                 alerts["trigger_4_protests"] = t4
-
-            # Trigger 5 — demonstrations near diplomatic/facility premises
             t5 = _check_trigger_5(events, facility_coords)
             if t5:
                 alerts["trigger_5_diplomatic"] = t5
@@ -475,432 +428,6 @@ async def run_africa_report(
         return await asyncio.wait_for(_impl(), timeout=180)
     except asyncio.TimeoutError:
         return {"error": "Query timed out after 180 seconds"}
-
-
-# ---------------------------------------------------------------------------
-# OpenSky helpers
-# ---------------------------------------------------------------------------
-
-async def _fetch_opensky_airport(
-    client: httpx.AsyncClient,
-    icao: str,
-    begin: int,
-    end: int,
-    on_chunk_done: object = None,
-) -> dict:
-    """Fetch departures and arrivals for one airport from OpenSky.
-
-    OpenSky /flights/departure and /flights/arrival endpoints allow up to
-    2-day (172 800 s) windows per request.  We split the range into 2-day
-    chunks and aggregate.
-
-    on_chunk_done: optional async callable invoked after each chunk for progress pings.
-    """
-    auth = (OPENSKY_USERNAME, OPENSKY_PASSWORD)
-    results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
-    CHUNK = 172800  # 2 days in seconds (max allowed by departure/arrival endpoints)
-
-    try:
-        t = begin
-        while t < end:
-            chunk_end = min(t + CHUNK, end)
-            dep = await client.get(
-                f"{OPENSKY_API_URL}/flights/departure",
-                params={"airport": icao, "begin": t, "end": chunk_end},
-                auth=auth,
-            )
-            if dep.status_code == 200:
-                results["departures"].extend(dep.json() or [])
-            elif dep.status_code not in (404,):
-                logging.warning("OpenSky %s departure: %s", icao, dep.status_code)
-
-            arr = await client.get(
-                f"{OPENSKY_API_URL}/flights/arrival",
-                params={"airport": icao, "begin": t, "end": chunk_end},
-                auth=auth,
-            )
-            if arr.status_code == 200:
-                results["arrivals"].extend(arr.json() or [])
-            elif arr.status_code not in (404,):
-                logging.warning("OpenSky %s arrival: %s", icao, arr.status_code)
-
-            t = chunk_end
-
-            if on_chunk_done:
-                await on_chunk_done()
-    except Exception as e:
-        results["error"] = str(e)
-        logging.error("OpenSky fetch error for %s: %s", icao, e)
-
-    return results
-
-
-def _extract_operator_from_callsign(callsign: str | None) -> str | None:
-    if not callsign:
-        return None
-    normalized = ''.join(ch for ch in callsign.upper().strip() if ch.isalnum())
-    if not normalized:
-        return None
-    letters = ''
-    for ch in normalized:
-        if ch.isalpha():
-            letters += ch
-        else:
-            break
-    if len(letters) < 2:
-        return None
-    return letters
-
-
-def _parse_datetime_to_ts(dt: str | None) -> int | None:
-    if not dt:
-        return None
-    dt = dt.strip().replace(' ', 'T')
-    if dt.endswith('Z'):
-        dt = dt[:-1] + '+00:00'
-    try:
-        return int(datetime.fromisoformat(dt).timestamp())
-    except Exception:
-        try:
-            return int(datetime.strptime(dt, '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).timestamp())
-        except Exception:
-            return None
-
-
-def _get_iata_for_icao(icao: str) -> str | None:
-    code = ICAO_TO_IATA.get(icao.upper().strip())
-    if not code or code == '\\N':
-        return None
-    return code
-
-
-def _count_disruptions(flights: list) -> dict:
-    """Count cancelled and delayed flights."""
-    cancelled = 0
-    delayed = 0
-    for flight in flights:
-        status = (flight.get("status") or "").lower()
-        if "cancel" in status:
-            cancelled += 1
-        elif "delay" in status:
-            delayed += 1
-    return {"cancelled_flights": cancelled, "delayed_flights": delayed, "total_disruptions": cancelled + delayed}
-
-
-def _summarise_flights(departures: list, arrivals: list, begin_ts: int | None = None, end_ts: int | None = None) -> dict:
-    """Build a summary with totals, daily time series, and trend vs first half of window."""
-    from collections import defaultdict
-    from datetime import datetime
-
-    all_flights = departures + arrivals
-    daily: dict[str, int] = defaultdict(int)
-    airline_codes: set[str] = set()
-    latest_flight_ts: int | None = None
-    operating_last_24h = False
-
-    for flight in all_flights:
-        ts = None
-        for key in ("firstSeen", "lastSeen", "scheduledTimeUtc", "actualTimeUtc", "departureTimeUtc", "arrivalTimeUtc"):
-            value = flight.get(key)
-            if isinstance(value, int):
-                ts = value
-                break
-            if isinstance(value, str):
-                ts = _parse_datetime_to_ts(value)
-                if ts is not None:
-                    break
-
-        if ts:
-            d = datetime.utcfromtimestamp(ts)
-            key = d.strftime("%Y-%m-%d")
-            daily[key] += 1
-            if latest_flight_ts is None or ts > latest_flight_ts:
-                latest_flight_ts = ts
-            if end_ts is not None and ts >= end_ts - 86400:
-                operating_last_24h = True
-
-        operator = _extract_operator_from_callsign(flight.get("callsign"))
-        if operator:
-            airline_codes.add(operator)
-
-    # Calculate reduction % if window boundaries provided
-    reduction_pct: float | None = None
-    if begin_ts is not None and end_ts is not None:
-        mid_ts = (begin_ts + end_ts) / 2
-        first_half = [f for f in all_flights if ((f.get("firstSeen") or f.get("lastSeen") or 0) < mid_ts)]
-        second_half = [f for f in all_flights if ((f.get("firstSeen") or f.get("lastSeen") or 0) >= mid_ts)]
-        if len(first_half) > 0:
-            reduction_pct = round((len(first_half) - len(second_half)) / len(first_half) * 100, 1)
-
-    latest_flight_date: str | None = None
-    if latest_flight_ts is not None:
-        latest_flight_date = datetime.utcfromtimestamp(latest_flight_ts).strftime("%Y-%m-%d")
-
-    return {
-        "total_flights": len(all_flights),
-        "total_departures": len(departures),
-        "total_arrivals": len(arrivals),
-        "daily_series": dict(sorted(daily.items())),
-        "reduction_pct": reduction_pct,
-        "operating": len(all_flights) > 0,
-        "operating_last_24h": operating_last_24h,
-        "latest_flight_date": latest_flight_date,
-        "airlines": sorted(airline_codes),
-        **_count_disruptions(all_flights),
-    }
-
-
-# ---------------------------------------------------------------------------
-# OpenSky MCP tools
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def fetch_airport_activity(
-    airport_icao: str,
-    days_back: int = 3,
-    ctx: Context | None = None,
-) -> dict:
-    """Fetch departures and arrivals for a specific African airport over the past N days.
-
-    Args:
-        airport_icao: ICAO airport code (e.g. "HKJK" for Nairobi, "FAOR" for Johannesburg).
-        days_back: Number of days to look back, max 3 (default 3).
-    """
-    async def _impl():
-        _days_back = min(max(days_back, 1), 3)
-        icao = airport_icao.upper().strip()
-        airport = get_airport(icao)
-        if airport is None:
-            return {"error": f"Airport '{icao}' not found in African airport database."}
-
-        if ctx:
-            await ctx.report_progress(0, 3, f"Querying OpenSky for {icao}...")
-
-        # End at start of today UTC — OpenSky batches data overnight
-        from datetime import datetime, timezone
-        now_utc = datetime.now(timezone.utc)
-        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        begin_ts = end_ts - (_days_back * 86400)
-
-        chunk_count = [0]
-        total_chunks = max(1, math.ceil((_days_back * 86400) / 172800))
-
-        async def _ping():
-            chunk_count[0] += 1
-            if ctx:
-                await ctx.report_progress(chunk_count[0], total_chunks, f"Fetching {icao} chunk {chunk_count[0]}/{total_chunks}")
-
-        async with httpx.AsyncClient(timeout=180) as client:
-            result = await _fetch_opensky_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
-
-        if ctx:
-            await ctx.report_progress(3, 3, "Summarising results...")
-
-        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-        return {
-            "airport": airport,
-            "period_days": _days_back,
-            **summary,
-            "error": result["error"],
-        }
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=300)
-    except asyncio.TimeoutError:
-        return {"error": "Query timed out after 300 seconds"}
-
-
-@mcp.tool()
-async def run_opensky_report(
-    reduction_threshold_pct: float = 25.0,
-    ctx: Context | None = None,
-) -> dict:
-    """Return today's cached OpenSky traffic reduction report across African airports (past 3 days).
-
-    Returns airports where flight volume dropped >25% comparing the first half of the
-    window to the second half, plus top 20 airports by reduction percentage.
-    Data is refreshed daily by the cron job.
-    """
-    # Check for cached data first
-    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
-    cache_file = cache_dir / f"traffic_reductions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
-
-    if cache_file.exists():
-        try:
-            with open(cache_file, 'r') as f:
-                cached_data = json.load(f)
-            if "opensky" in cached_data["data"]:
-                return cached_data["data"]["opensky"]
-        except Exception as e:
-            print(f"Cache read failed: {e}")
-
-    # No cache available - return message about data refresh
-    return {
-        "error": "Data not yet available",
-        "message": "Traffic reduction data is being refreshed. Please try again in a few minutes.",
-        "next_refresh": "Data refreshes daily at midnight UTC",
-        "cache_file_checked": str(cache_file)
-    }
-
-
-async def _fetch_aerodatabox_airport(
-    client: httpx.AsyncClient,
-    icao: str,
-    begin: int,
-    end: int,
-    on_chunk_done: object = None,
-) -> dict:
-    results: dict = {"icao": icao, "departures": [], "arrivals": [], "error": None}
-    chunk_size = 43200  # 12 hours max window for AeroDataBox airport flights endpoint
-    headers = {
-        "X-RapidAPI-Key": AERODATA_API_KEY,
-        "X-RapidAPI-Host": AERODATA_API_HOST,
-    }
-
-    t = begin
-    while t < end:
-        chunk_end = min(t + chunk_size, end)
-        begin_s = datetime.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M")
-        end_s = datetime.utcfromtimestamp(chunk_end).strftime("%Y-%m-%dT%H:%M")
-        try:
-            resp = await client.get(
-                f"{AERODATA_API_URL}/flights/airports/icao/{icao}/{begin_s}/{end_s}",
-                headers=headers,
-                timeout=60,
-            )
-        except Exception as e:
-            results["error"] = str(e)
-            logging.error("AeroDataBox fetch error for %s: %s", icao, e)
-            break
-
-        if resp.status_code == 200:
-            payload = resp.json() or {}
-            results["departures"].extend(payload.get("departures", []))
-            results["arrivals"].extend(payload.get("arrivals", []))
-        elif resp.status_code == 429:
-            delay = int(resp.headers.get("Retry-After", "30"))
-            await asyncio.sleep(max(delay, 30))
-            continue
-        elif resp.status_code not in (404,):
-            logging.warning("AeroDataBox %s %s -> %s", icao, begin_s, resp.status_code)
-
-        t = chunk_end
-        if on_chunk_done:
-            await on_chunk_done()
-        await asyncio.sleep(0.25)
-
-    return results
-
-
-@mcp.tool()
-async def fetch_airport_activity_aerodata(
-    airport_icao: str,
-    days_back: int = 3,
-    ctx: Context | None = None,
-) -> dict:
-    """Fetch departures and arrivals for a specific African airport using AeroDataBox."""
-    if not AERODATA_API_KEY:
-        return {"error": "AERODATA_API_KEY is not configured."}
-
-    async def _impl():
-        _days_back = min(max(days_back, 1), 3)
-        icao = airport_icao.upper().strip()
-        airport = get_airport(icao)
-        if airport is None:
-            return {"error": f"Airport '{icao}' not found in African airport database."}
-
-        if ctx:
-            await ctx.report_progress(0, 3, f"Querying AeroDataBox for {icao}...")
-
-        now_utc = datetime.now(timezone.utc)
-        end_ts = int(now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        begin_ts = end_ts - (_days_back * 86400)
-
-        chunk_count = [0]
-        total_chunks = max(1, math.ceil((_days_back * 86400) / 43200))
-
-        async def _ping():
-            chunk_count[0] += 1
-            if ctx:
-                await ctx.report_progress(chunk_count[0], total_chunks, f"Fetching {icao} chunk {chunk_count[0]}/{total_chunks}")
-
-        async with httpx.AsyncClient(timeout=180) as client:
-            result = await _fetch_aerodatabox_airport(client, icao, begin_ts, end_ts, on_chunk_done=_ping)
-
-        if ctx:
-            await ctx.report_progress(3, 3, "Summarising results...")
-
-        summary = _summarise_flights(result["departures"], result["arrivals"], begin_ts, end_ts)
-        return {
-            "airport": airport,
-            "period_days": _days_back,
-            **summary,
-            "error": result["error"],
-        }
-
-    try:
-        return await asyncio.wait_for(_impl(), timeout=300)
-    except asyncio.TimeoutError:
-        return {"error": "Query timed out after 300 seconds"}
-
-
-@mcp.tool()
-async def run_aerodatabox_report(
-    reduction_threshold_pct: float = 25.0,
-    ctx: Context | None = None,
-) -> dict:
-    """Return today's cached AeroDataBox traffic reduction report across African airports (past 3 days).
-
-    Returns airports where flight volume dropped >25%, plus top 20 by reduction percentage.
-    Data is refreshed daily by the cron job.
-    """
-    if not AERODATA_API_KEY:
-        return {"error": "AERODATA_API_KEY is not configured."}
-
-    # Check for cached data first
-    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
-    cache_file = cache_dir / f"traffic_reductions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
-
-    if cache_file.exists():
-        try:
-            with open(cache_file, 'r') as f:
-                cached_data = json.load(f)
-            if "aerodatabox" in cached_data["data"]:
-                return cached_data["data"]["aerodatabox"]
-        except Exception as e:
-            print(f"Cache read failed: {e}")
-
-    # No cache available - return message about data refresh
-    return {
-        "error": "Data not yet available",
-        "message": "Traffic reduction data is being refreshed. Please try again in a few minutes.",
-        "next_refresh": "Data refreshes daily at midnight UTC",
-        "cache_file_checked": str(cache_file)
-    }
-
-
-@mcp.tool()
-async def scan_african_airports_for_disruptions() -> dict:
-    """Return today's cached aviation disruption report across African airports (past 3 days).
-
-    Returns airports where cancelled+delayed flights exceed 25%, plus top 20 by count and percentage.
-    Data is refreshed daily by the cron job. Source: AeroDataBox.
-    """
-    cache_dir = Path("/data/cache") if Path("/data").exists() else Path("cache")
-    cache_file = cache_dir / f"aviation_disruptions_{datetime.utcnow().strftime('%Y-%m-%d')}.json"
-
-    if cache_file.exists():
-        try:
-            with open(cache_file, "r") as f:
-                return json.load(f)["data"]
-        except Exception as e:
-            return {"error": f"Cache read failed: {e}"}
-
-    return {
-        "error": "Data not yet available",
-        "message": "Disruption data is refreshed daily. Please try again later.",
-        "next_refresh": "Data refreshes daily at midnight UTC",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1043,19 +570,12 @@ async def run_travel_advisories_report() -> dict:
 
 @mcp.tool()
 async def test_connectivity() -> dict:
-    """Test outbound connectivity to ACLED and OpenSky APIs.
-
-    Returns status codes, errors, and credential presence for debugging.
-    """
+    """Test outbound connectivity to ACLED API and advisory sources."""
     results: dict[str, object] = {
         "acled_username_set": bool(ACLED_USERNAME),
         "acled_password_set": bool(ACLED_PASSWORD),
-        "opensky_username_set": bool(OPENSKY_USERNAME),
-        "opensky_password_set": bool(OPENSKY_PASSWORD),
-        "aerodatabox_api_key_set": bool(AERODATA_API_KEY),
     }
 
-    # Test ACLED token endpoint
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
@@ -1068,40 +588,9 @@ async def test_connectivity() -> dict:
                 },
             )
             results["acled_token_status"] = resp.status_code
-            results["acled_token_body"] = resp.text[:500]
     except Exception as exc:
         results["acled_token_error"] = str(exc)
 
-    # Test OpenSky endpoint (simple departures query)
-    try:
-        now = int(time.time())
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{OPENSKY_API_URL}/flights/departure",
-                params={"airport": "HKJK", "begin": now - 7200, "end": now},
-                auth=(OPENSKY_USERNAME, OPENSKY_PASSWORD) if OPENSKY_USERNAME else None,
-            )
-            results["opensky_status"] = resp.status_code
-            results["opensky_body"] = resp.text[:500]
-    except Exception as exc:
-        results["opensky_error"] = str(exc)
-
-    if AERODATA_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    f"{AERODATA_API_URL}/flights/airports/icao/HKJK/{datetime.utcfromtimestamp(int(time.time() - 43200)).strftime('%Y-%m-%dT%H:%M')}/{datetime.utcfromtimestamp(int(time.time())).strftime('%Y-%m-%dT%H:%M')}",
-                    headers={
-                        "X-RapidAPI-Key": AERODATA_API_KEY,
-                        "X-RapidAPI-Host": AERODATA_API_HOST,
-                    },
-                )
-                results["aerodatabox_status"] = resp.status_code
-                results["aerodatabox_body"] = resp.text[:500]
-        except Exception as exc:
-            results["aerodatabox_error"] = str(exc)
-
-    # Test basic DNS / outbound connectivity
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get("https://httpbin.org/ip")
@@ -1113,7 +602,7 @@ async def test_connectivity() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Daily cache scheduler — runs fetch_and_cache.main() at 02:00 UTC (06:00 ABT)
+# Daily cache scheduler — 03:00 UTC = 04:00 Morocco summer time
 # ---------------------------------------------------------------------------
 
 async def _daily_cache_loop() -> None:
@@ -1124,7 +613,7 @@ async def _daily_cache_loop() -> None:
         if next_run <= now:
             next_run += timedelta(days=1)
         delay = (next_run - now).total_seconds()
-        logging.info("Cache refresh scheduled in %.0f s (at %s UTC / 04:00 Morocco summer)", delay, next_run.strftime("%Y-%m-%d %H:%M"))
+        logging.info("Cache refresh in %.0f s (at %s UTC)", delay, next_run.strftime("%Y-%m-%d %H:%M"))
         await asyncio.sleep(delay)
         try:
             await fetch_and_cache.main()
@@ -1133,8 +622,6 @@ async def _daily_cache_loop() -> None:
 
 
 if __name__ == "__main__":
-    from contextlib import asynccontextmanager
-
     @asynccontextmanager
     async def lifespan(server):
         task = asyncio.create_task(_daily_cache_loop())
