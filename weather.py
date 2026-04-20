@@ -424,6 +424,115 @@ async def fetch_fao_diem_africa(client: httpx.AsyncClient) -> dict:
 # ICPAC (East Africa only — Droughtwatch + EA Hazards Watch)
 # ---------------------------------------------------------------------------
 
+ICPAC_EAST_AFRICA = [
+    "Burundi", "Comoros", "Djibouti", "Eritrea", "Ethiopia",
+    "Kenya", "Rwanda", "Somalia", "South Sudan", "Sudan", "Tanzania", "Uganda",
+]
+
+# Maps threat category name → keywords to match against dataset names (lowercase)
+ICPAC_THREAT_KW: dict[str, list[str]] = {
+    "Drought Conditions": [
+        "drought", "cdi", "aridity", "hydrological drought", "standardized precipitation",
+        "drought recovery", "drought indicator",
+    ],
+    "Rainfall & Flood Risk": [
+        "precipitation", "rainfall", "rain forecast", "flood", "inundation",
+    ],
+    "Temperature & Heat Stress": [
+        "temperature", "heat wave", "heatstress", "heat stress", "cold wave",
+        "thermal", "mean temprature",
+    ],
+    "Soil Moisture & Vegetation Stress": [
+        "soil moisture", "vegetation", "ndvi", "biomass",
+    ],
+    "Agricultural & Livelihood Impacts": [
+        "crop", "rangeland", "forage", "agricultural", "harvest", "livelihood",
+    ],
+    "Disease & Pest Outbreaks": [
+        "outbreak", "disease", "pest", "locust", "malaria", "rift valley", "cholera",
+    ],
+}
+
+# Legend items indicating severity levels we care about (Alert > Warning > Watch > No drought)
+_SEVERITY_KEYWORDS = {"alert", "warning", "watch", "high-risk", "high risk", "moderate", "exceptional"}
+
+
+def _classify_icpac(name: str) -> str | None:
+    lower = name.lower()
+    for threat, keywords in ICPAC_THREAT_KW.items():
+        if any(k in lower for k in keywords):
+            return threat
+    return None
+
+
+def _format_icpac_period(layer: dict) -> str | None:
+    year = layer.get("end_year")
+    if not year:
+        return None
+    month = layer.get("end_month")
+    dekad = layer.get("end_dekad")
+    month_name = ""
+    if month:
+        s = str(month).lower()[:3]
+        month_map = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+        try:
+            m = int(s) if s.isdigit() else month_map.get(s, 0)
+            if m:
+                month_name = datetime(year=int(year), month=m, day=1).strftime("%B")
+        except (ValueError, TypeError):
+            month_name = str(month)
+    parts = [str(year)]
+    if month_name:
+        parts.append(month_name)
+    if dekad:
+        try:
+            dk_label = {1: "Dekad 1 (1–10)", 2: "Dekad 2 (11–20)", 3: "Dekad 3 (21–31)"}
+            parts.append(dk_label.get(int(dekad), f"Dekad {dekad}"))
+        except (ValueError, TypeError):
+            pass
+    return " ".join(parts)
+
+
+def _extract_severity_scale(layer: dict) -> list[str]:
+    items = layer.get("legendConfig", {}).get("items") or []
+    return [
+        i["name"] for i in items
+        if i.get("name") and any(k in i["name"].lower() for k in _SEVERITY_KEYWORDS)
+    ]
+
+
+def _build_icpac_threats(datasets: list[dict], current_year: int) -> dict[str, dict]:
+    threats: dict[str, dict] = {}
+    for ds in datasets:
+        threat = _classify_icpac(ds.get("name", ""))
+        if not threat:
+            continue
+        layer = ds["layers"][0] if ds.get("layers") else {}
+        end_year = layer.get("end_year")
+        is_current = bool(end_year and int(end_year) >= current_year - 1)
+        period = _format_icpac_period(layer)
+        severity_scale = _extract_severity_scale(layer)
+        entry = {
+            "name": ds.get("name", ""),
+            "latest_period": period,
+            "is_current": is_current,
+            "severity_scale": severity_scale,
+        }
+        if threat not in threats:
+            threats[threat] = {"datasets": [], "latest_period": None, "severity_scale": []}
+        threats[threat]["datasets"].append(entry)
+        # Keep most recent period across all datasets in this threat
+        if is_current and period and (
+            threats[threat]["latest_period"] is None
+            or str(end_year) > threats[threat]["latest_period"][:4]
+        ):
+            threats[threat]["latest_period"] = period
+        if severity_scale and not threats[threat]["severity_scale"]:
+            threats[threat]["severity_scale"] = severity_scale
+    return threats
+
+
 async def _icpac_fetch(client: httpx.AsyncClient, bases: list[str], path: str) -> list:
     errors: list[str] = []
     for base in bases:
@@ -440,39 +549,39 @@ async def _icpac_fetch(client: httpx.AsyncClient, bases: list[str], path: str) -
 
 
 async def fetch_icpac_droughtwatch(client: httpx.AsyncClient) -> dict:
-    """Fetch ICPAC Droughtwatch dataset catalog."""
+    """Fetch ICPAC Droughtwatch datasets and classify into 6 threat categories."""
     try:
-        categories = await _icpac_fetch(client, ICPAC_DROUGHTWATCH_BASES, "/categories/")
         datasets = await _icpac_fetch(client, ICPAC_DROUGHTWATCH_BASES, "/datasets/")
+        current_year = datetime.now(timezone.utc).year
+        threats = _build_icpac_threats(datasets, current_year)
         return {
             "fetched_at": _now_iso(),
             "available": True,
-            "coverage": "East Africa (Burundi, Comoros, Djibouti, Eritrea, Ethiopia, Kenya, Rwanda, Somalia, South Sudan, Sudan, Tanzania, Uganda)",
-            "category_count": len(categories),
-            "dataset_count": len(datasets),
-            "categories": categories,
-            "datasets": datasets,
+            "source": "ICPAC Droughtwatch",
+            "coverage": "East Africa",
+            "threats": threats,
         }
     except Exception as e:
         return {"fetched_at": _now_iso(), "available": False, "error": str(e)}
 
 
 async def fetch_icpac_ea_hazards(client: httpx.AsyncClient) -> dict:
-    """Fetch ICPAC EA Hazards Watch dataset catalog."""
+    """Fetch ICPAC EA Hazards Watch datasets and classify into 6 threat categories."""
     try:
         datasets = await _icpac_fetch(client, ICPAC_EA_HAZARDS_BASES, "/datasets")
-        categories = sorted({
-            ds.get("category") for ds in datasets
-            if isinstance(ds, dict) and ds.get("category")
-        })
+        # Filter out boundary/infrastructure datasets (no layers or isBoundary flag)
+        relevant = [
+            ds for ds in datasets
+            if not ds.get("isBoundary") and ds.get("layers")
+        ]
+        current_year = datetime.now(timezone.utc).year
+        threats = _build_icpac_threats(relevant, current_year)
         return {
             "fetched_at": _now_iso(),
             "available": True,
+            "source": "ICPAC EA Hazards Watch",
             "coverage": "East Africa",
-            "category_count": len(categories),
-            "dataset_count": len(datasets),
-            "categories": categories,
-            "datasets": datasets,
+            "threats": threats,
         }
     except Exception as e:
         return {"fetched_at": _now_iso(), "available": False, "error": str(e)}
@@ -954,6 +1063,58 @@ def _events_from_fao_diem(data: dict) -> list[dict]:
     return events
 
 
+def _events_from_icpac(droughtwatch: dict, ea_hazards: dict) -> list[dict]:
+    """
+    Merge ICPAC Droughtwatch + EA Hazards into one event per active threat category.
+    Both sources cover East Africa only.
+    """
+    # Merge threat data from both sources — Droughtwatch is primary (has temporal metadata)
+    merged: dict[str, dict] = {}
+
+    for src_data in (droughtwatch, ea_hazards):
+        if not src_data.get("available"):
+            continue
+        for threat, info in src_data.get("threats", {}).items():
+            current_datasets = [d for d in info.get("datasets", []) if d.get("is_current")]
+            if not current_datasets:
+                continue
+            if threat not in merged:
+                merged[threat] = {
+                    "datasets": [],
+                    "latest_period": None,
+                    "severity_scale": [],
+                    "sources": [],
+                }
+            merged[threat]["datasets"].extend(current_datasets)
+            merged[threat]["sources"].append(src_data.get("source", "ICPAC"))
+            if info.get("latest_period") and not merged[threat]["latest_period"]:
+                merged[threat]["latest_period"] = info["latest_period"]
+            if info.get("severity_scale") and not merged[threat]["severity_scale"]:
+                merged[threat]["severity_scale"] = info["severity_scale"]
+
+    events = []
+    for threat, info in merged.items():
+        period = info.get("latest_period") or "current period"
+        ds_names = [d["name"] for d in info["datasets"][:4]]
+        severity_scale = info.get("severity_scale", [])
+        sources = list(dict.fromkeys(info.get("sources", ["ICPAC"])))
+
+        detail_parts = [f"Datasets: {', '.join(ds_names)}"]
+        if severity_scale:
+            detail_parts.append(f"Severity scale: {' → '.join(severity_scale)}")
+
+        events.append(_event(
+            tier="Monitor", status="continuing",
+            event_type=threat,
+            location="East Africa",
+            countries_impacted=ICPAC_EAST_AFRICA,
+            headline=f"ICPAC monitoring: {threat} — data current to {period}",
+            detail=". ".join(detail_parts),
+            source=", ".join(sources),
+        ))
+    return events
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1002,6 +1163,7 @@ async def fetch_weather_africa_report() -> dict:
     all_events.extend(_events_from_cams(src.get("cams_air_quality", {})))
     all_events.extend(_events_from_acmad(src.get("acmad_decadal", {})))
     all_events.extend(_events_from_fao_diem(src.get("fao_diem", {})))
+    all_events.extend(_events_from_icpac(src.get("icpac_droughtwatch", {}), src.get("icpac_ea_hazards", {})))
 
     def _bucket(status: str) -> list[dict]:
         return _tier_sort([e for e in all_events if e["status"] == status])
@@ -1040,8 +1202,8 @@ async def fetch_weather_africa_report() -> dict:
             "cams_high_risk_zones": src.get("cams_air_quality", {}).get("high_risk_zones"),
             "cams_watch_zones": src.get("cams_air_quality", {}).get("watch_zones"),
             "harmattan_season": src.get("cams_air_quality", {}).get("harmattan_season"),
-            "icpac_droughtwatch_datasets": src.get("icpac_droughtwatch", {}).get("dataset_count"),
-            "icpac_ea_hazards_datasets": src.get("icpac_ea_hazards", {}).get("dataset_count"),
+            "icpac_droughtwatch_threats": list(src.get("icpac_droughtwatch", {}).get("threats", {}).keys()),
+            "icpac_ea_hazards_threats": list(src.get("icpac_ea_hazards", {}).get("threats", {}).keys()),
             "fao_diem_countries_monitored": src.get("fao_diem", {}).get("countries_with_data"),
             "acmad_reporting_period": src.get("acmad_decadal", {}).get("reporting_period"),
         },
