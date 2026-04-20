@@ -417,8 +417,10 @@ async def fetch_state_dept(client: httpx.AsyncClient, country: str) -> dict:
                     "url": "https://travel.state.gov/content/travel/en/traveladvisories/traveladvisories.html",
                 }
 
-        # Token-based LIKE queries
+        # Token-based LIKE queries — only use long, distinctive tokens (≥6 chars)
         for token in tokens:
+            if len(token) < 6:
+                continue
             token_clean = token.replace("'", "''")
             attrs = await _try_where(f"Country_Name LIKE '%{token_clean}%'")
             if attrs:
@@ -477,11 +479,13 @@ async def fetch_state_dept(client: httpx.AsyncClient, country: str) -> dict:
                             "primary_driver": _extract_primary_driver(attrs.get("Advisory_Text") or attrs.get("Latest_Headline") or ""),
                             "url": "https://travel.state.gov/content/travel/en/traveladvisories/traveladvisories.html",
                         }
-                # token fallback
+                # token fallback — only match if normalised candidate is a substring (not reverse)
                 for cand in profile["state_dept_names"]:
                     n = _normalize_name_for_lookup(cand)
+                    if len(n) < 4:
+                        continue
                     for k, attrs in mapping.items():
-                        if n in k or k in n:
+                        if n in k:
                             level = int(attrs.get("Advisory_Level") or 0)
                             updated_at = None
                             if attrs.get("Date_Updated"):
@@ -759,14 +763,12 @@ async def fetch_dfat(client: httpx.AsyncClient, country: str, table: dict[str, d
                 slug_candidates.add(f"{s}-{canonical_slug}")
                 slug_candidates.add(f"{canonical_slug}-{s}")
 
-        region_candidates = ["africa", "asia", "europe", "americas", "oceania", "asia-pacific"]
-
         page_text = None
         page_url = None
         for slug in slug_candidates:
             if not slug:
                 continue
-            for region in (["africa"] + region_candidates + [None]):
+            for region in (["africa", None]):
                 if region:
                     url = f"https://www.smartraveller.gov.au/destinations/{region}/{slug}"
                 else:
