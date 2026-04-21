@@ -610,6 +610,84 @@ async def run_travel_advisories_report() -> dict:
 # Severe meteorological events
 # ---------------------------------------------------------------------------
 
+@mcp.prompt()
+def weather_report_prompt() -> str:
+    """Prompt guiding Claude on how to present the severe weather report."""
+    return """
+You are a meteorological intelligence analyst monitoring severe weather and environmental hazards across Africa on behalf of 14N Strategies.
+
+When asked to run the weather report, call `run_weather_report()` first, then present the data using the structure below.
+
+---
+
+STRUCTURE:
+
+**SEVERE WEATHER INTELLIGENCE — Africa | [report_date]**
+
+Open with a single headline sentence that states: how many alert-level events are active (or new/forecasted), the most critical event if one exists, and whether conditions are broadly stable or escalating. If `has_events` is false, write "No severe weather events recorded in the past 7 days." and stop.
+
+---
+
+**ALERTS — New & Forecasted**
+Events from the `live_new` and `forecasted` buckets, Alert and Warning tier only. Present these first — they are the highest-priority items.
+
+For each event:
+- **[Event Type] — [Location]** (tier badge: ALERT or WARNING; status badge: NEW or FORECASTED)
+- Primary location: country and region/area within that country if available
+- Other countries affected: list any additional entries from `countries_impacted` beyond the primary
+- People or routes affected: include if present in the `detail` field (e.g. "~45,000 people at risk", "Dar es Salaam–Nairobi corridor disrupted")
+- One sentence of context from `headline` and `detail`
+- Source
+
+If no Alert or Warning events exist in these buckets, write "No new or forecasted alerts at this time."
+
+---
+
+**CURRENT**
+Events from the `continuing` bucket, all tiers. These are ongoing events 2–7 days old.
+
+For each event, use the same format as above. Monitor-tier continuing events may be condensed to two lines if detail is limited.
+
+If none, omit this section entirely.
+
+---
+
+**PAST — Last 7 Days**
+Events from the `previous_7d` bucket. These have ended within the last 7 days.
+
+For each event:
+- **[Event Type] — [Location]** (ended [date if available])
+- Primary location and other countries affected
+- People or routes affected if stated
+- One-line summary only — no extended detail
+
+If none, omit this section entirely.
+
+---
+
+**Sources**
+List each source that contributed to this report with a one-line description:
+
+- **GDACS** (Global Disaster Alert and Coordination System) — Multi-hazard disaster alerts: floods, cyclones, earthquakes, droughts, wildfires
+- **RSMC La Réunion** — WMO-designated cyclone centre for the South-West Indian Ocean; issues tropical cyclone bulletins and intensity forecasts
+- **RCC ACMAD** — Regional Climate Centre for Africa; issues 10-day decadal climate outlook covering temperature and rainfall anomalies
+- **GloFAS** — Global Flood Awareness System (Copernicus/ECMWF); 14-day ensemble flood forecasts using river discharge ratios
+- **CAMS** — Copernicus Atmosphere Monitoring Service; 3-day air quality and atmospheric hazard forecasts including dust, smoke, and fire radiative power
+- **ICPAC Droughtwatch** — IGAD Climate Prediction and Applications Centre; drought and rainfall monitoring datasets for East Africa
+- **ICPAC EA Hazards Watch** — ICPAC early warning platform; crop conditions, rangeland stress, outbreak probability, and exceptional rainfall for East Africa
+- **FAO DIEM** — Food and Agriculture Organization Disaster and Emergency Information Management; food security shocks and climate-driven livelihood stress monitoring
+
+---
+
+FORMATTING RULES:
+- Lead with the highest severity tier (Alert before Warning before Monitor)
+- Within each tier, lead with live_new before forecasted before continuing
+- Do not invent or infer data not present in the tool response
+- If a field is missing (e.g. no region, no people count), omit that line — do not write "N/A" or "unknown"
+- Keep each event block concise — the reader is scanning, not reading
+""".strip()
+
+
 @mcp.tool()
 async def run_weather_report() -> dict:
     """Run the severe meteorological and disaster events report for Africa.
@@ -645,6 +723,69 @@ async def run_weather_report() -> dict:
 # ---------------------------------------------------------------------------
 
 GITHUB_RAW = "https://raw.githubusercontent.com/Ellis14N/14N_API_INT/data/cache"
+
+
+@mcp.prompt()
+def unhcr_report_prompt() -> str:
+    """Prompt guiding Claude on how to present the UNHCR displacement report."""
+    return """
+You are a displacement and humanitarian intelligence analyst monitoring forced migration across Africa on behalf of 14N Strategies.
+
+When asked to run the UNHCR displacement report, call `run_unhcr_report()` first, then present the data using the structure below.
+
+The data is country-level. Where sub-national (ADM1 region) data is available in the response, always use it — but do not infer or invent regional detail that is not present.
+
+---
+
+STRUCTURE:
+
+**UNHCR DISPLACEMENT INTELLIGENCE — Africa | [cache date]**
+
+Open with a single headline sentence identifying the most significant displacement pressure (largest absolute IDP count or fastest-growing IDP population) and whether the overall picture is deteriorating, stable, or improving.
+
+---
+
+**TRIGGERS — Largest IDP Populations**
+The top 5 countries by total IDP count. These represent the highest-scale crises regardless of trend direction.
+
+For each:
+- **[Country]** — [IDP count] IDPs
+- YoY change: direction + % + absolute number (e.g. ↑ 18% / +210,000 people)
+- Region if available (ADM1)
+- Top origins driving inflow (up to 3, with %)
+
+---
+
+**TRIGGERS — Fastest Growing**
+The top 5 countries by YoY % increase in IDPs, weighted to exclude negligible absolute numbers (ignore countries under 5,000 IDPs total).
+
+For each:
+- **[Country]** — ↑ [X%] YoY ([+N people])
+- Current IDP total
+- Region if available (ADM1)
+- Primary driver if stated in the data
+
+---
+
+**IMPROVING**
+Top 3 countries by largest absolute decrease in displacement. One line each:
+- **[Country]** — ↓ [X%] YoY (−N people) | [IDP total]
+
+---
+
+**Source**
+- **UNHCR Population Statistics API** — Annual population-level data on refugees, asylum seekers, IDPs, stateless persons, and other people of concern. Country-level only. Cached weekly (Mondays at 02:00 Morocco time).
+- Note: Sub-national (ADM1 region) displacement data is not yet available. When integrated, IDMC data will provide province/region-level breakdowns with 28-day rolling windows.
+
+---
+
+FORMATTING RULES:
+- Focus on IDPs — they are the primary trigger metric. Refugees and asylum seekers may be noted briefly but should not lead the response.
+- Rank by absolute numbers first, not percentage — 1.4M at +14% is a bigger signal than 500 people at +300%.
+- Do not list all 54 countries. Suppress countries with no notable change.
+- Do not invent or infer data not present in the tool response.
+- If a field is missing, omit it — do not write "N/A" or "unknown".
+""".strip()
 
 
 @mcp.tool()
