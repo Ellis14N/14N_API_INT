@@ -2,7 +2,7 @@ name: Cache ACLED Report
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # 01:00 UTC = 02:00 Morocco summer time (UTC+1)
+    - cron: '5 23 * * *'  # 23:05 UTC = 00:05 Morocco (UTC+1)
   workflow_dispatch:        # allow manual trigger from GitHub UI
 
 permissions:
