@@ -382,7 +382,7 @@ async def run_africa_report(
         else:
             return {
                 "error": "Data not yet available",
-                "message": "ACLED data is refreshed daily at 03:00 UTC. Please try again after the cache has been populated, or run the cron job manually.",
+                "message": "ACLED data is refreshed daily at 00:05 Morocco time. Please try again after the cache has been populated, or run the cron job manually.",
             }
 
     async def _impl():
@@ -512,7 +512,7 @@ Keep responses concise and intelligence-focused. Flag the most severe changes fi
 async def run_travel_advisories_report() -> dict:
     """Run the daily travel advisory report for all 54 African countries.
 
-    Reads today's cached snapshot (populated at 02:00 Morocco time by GitHub Actions)
+    Reads today's cached snapshot (populated at 00:05 Morocco time by GitHub Actions)
     and compares against yesterday's to surface any new or elevated advisories.
     """
     GITHUB_RAW = "https://raw.githubusercontent.com/Ellis14N/14N_API_INT/data/cache"
@@ -527,7 +527,7 @@ async def run_travel_advisories_report() -> dict:
         if resp.status_code == 404:
             return {
                 "error": "Data not yet available",
-                "message": f"Travel advisory cache for {today_label} has not been generated yet. It refreshes daily at 02:00 Morocco time. Try again later or trigger the workflow manually in GitHub Actions.",
+                "message": f"Travel advisory cache for {today_label} has not been generated yet. It refreshes daily at 00:05 Morocco time. Try again later or trigger the workflow manually in GitHub Actions.",
             }
         resp.raise_for_status()
         today_data: dict = resp.json()["data"]
@@ -710,7 +710,7 @@ async def run_weather_report() -> dict:
         if resp.status_code == 404:
             return {
                 "error": "Data not yet available",
-                "message": f"Weather cache for {today_label} has not been generated yet. It refreshes daily at 01:00 UTC (02:00 Morocco). Trigger the workflow manually in GitHub Actions.",
+                "message": f"Weather cache for {today_label} has not been generated yet. It refreshes daily at 00:05 Morocco time. Trigger the workflow manually in GitHub Actions.",
             }
         resp.raise_for_status()
         return resp.json()["data"]
@@ -774,7 +774,7 @@ Top 3 countries by largest absolute decrease in displacement. One line each:
 ---
 
 **Source**
-- **UNHCR Population Statistics API** — Annual population-level data on refugees, asylum seekers, IDPs, stateless persons, and other people of concern. Country-level only. Cached weekly (Mondays at 02:00 Morocco time).
+- **UNHCR Population Statistics API** — Annual population-level data on refugees, asylum seekers, IDPs, stateless persons, and other people of concern. Country-level only. Cached weekly (Mondays at 00:05 Morocco time).
 - Note: Sub-national (ADM1 region) displacement data is not yet available. When integrated, IDMC data will provide province/region-level breakdowns with 28-day rolling windows.
 
 ---
