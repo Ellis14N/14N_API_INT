@@ -2,7 +2,7 @@ name: Cache Travel Advisories
 
 on:
   schedule:
-    - cron: '5 23 * * *'  # 23:05 UTC = 00:05 Morocco (UTC+1)
+    - cron: '5 22 * * *'  # 22:05 UTC + ~6hr GitHub delay = 04:05 Morocco (UTC+1)
   workflow_dispatch:        # allow manual trigger from GitHub UI
 
 permissions:
