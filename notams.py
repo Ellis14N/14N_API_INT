@@ -21,7 +21,9 @@ SKYLINK_URL = f"https://{SKYLINK_HOST}/notams"
 AUTOROUTER_BATCH_SIZE = 5
 AUTOROUTER_LIMIT = 100
 SKYLINK_LIMIT = 50
-SKYLINK_CONCURRENCY = 6
+# RapidAPI free tiers cap at ~1 req/s. Stay sequential and pace ourselves.
+SKYLINK_DELAY_S = 1.2
+SKYLINK_RETRY_DELAY_S = 5.0
 
 # Major African airports (one or two per country, capitals + key hubs).
 # Override per call by passing `icao_codes`.
@@ -501,24 +503,36 @@ def _normalize_skylink(item: dict, fallback_icao: str) -> dict | None:
 async def _fetch_skylink_one(
     client: httpx.AsyncClient,
     icao: str,
-    semaphore: asyncio.Semaphore,
 ) -> tuple[str, list[dict] | Exception]:
-    async with semaphore:
+    """Fetch a single airport. Retries once on 429 honouring Retry-After."""
+    url = f"{SKYLINK_URL}/{icao}"
+    params = {"limit": SKYLINK_LIMIT}
+    for attempt in (1, 2):
         try:
-            # ICAO is a path parameter on the RapidAPI listing: /notams/{icao}
-            resp = await client.get(f"{SKYLINK_URL}/{icao}", params={"limit": SKYLINK_LIMIT})
+            resp = await client.get(url, params=params)
+        except Exception as e:
+            return icao, e
+        if resp.status_code == 429 and attempt == 1:
+            retry_after = resp.headers.get("retry-after")
+            try:
+                wait = float(retry_after) if retry_after else SKYLINK_RETRY_DELAY_S
+            except ValueError:
+                wait = SKYLINK_RETRY_DELAY_S
+            await asyncio.sleep(min(wait, 30.0))
+            continue
+        try:
             resp.raise_for_status()
             payload = resp.json()
         except Exception as e:
             return icao, e
-
-    if isinstance(payload, list):
-        return icao, payload
-    if isinstance(payload, dict):
-        for key in ("notams", "data", "results", "items"):
-            if isinstance(payload.get(key), list):
-                return icao, payload[key]
-    return icao, []
+        if isinstance(payload, list):
+            return icao, payload
+        if isinstance(payload, dict):
+            for key in ("notams", "data", "results", "items"):
+                if isinstance(payload.get(key), list):
+                    return icao, payload[key]
+        return icao, []
+    return icao, RuntimeError("retry exhausted")
 
 
 async def fetch_skylink_notams(
@@ -543,11 +557,13 @@ async def fetch_skylink_notams(
         "Accept": "application/json",
         "User-Agent": "14N-API-INT/1.0",
     }
-    semaphore = asyncio.Semaphore(SKYLINK_CONCURRENCY)
+    # Sequential with pacing — RapidAPI free tier ~1 req/s. ~57 airports * 1.2s ≈ 70s.
+    results: list[tuple[str, list[dict] | Exception]] = []
     async with httpx.AsyncClient(timeout=30, headers=headers) as client:
-        results = await asyncio.gather(
-            *[_fetch_skylink_one(client, icao, semaphore) for icao in codes]
-        )
+        for i, icao in enumerate(codes):
+            if i > 0:
+                await asyncio.sleep(SKYLINK_DELAY_S)
+            results.append(await _fetch_skylink_one(client, icao))
 
     for icao, outcome in results:
         if isinstance(outcome, Exception):
