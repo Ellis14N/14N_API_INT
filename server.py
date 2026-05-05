@@ -12,6 +12,11 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 
 from countries import ACLED_NAMES, resolve_country, AFRICAN_CANONICAL_NAMES
+from notams import (
+    DEFAULT_AFRICAN_AIRPORTS,
+    fetch_autorouter_notams,
+    fetch_skylink_notams,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -821,6 +826,164 @@ async def run_unhcr_report() -> dict:
         return data
     except Exception as e:
         return {"error": f"Cache fetch failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# NOTAMs (Autorouter + SkyLink)
+# ---------------------------------------------------------------------------
+
+@mcp.prompt()
+def notams_report_prompt() -> str:
+    """Prompt guiding Claude on how to present the African airport NOTAM report."""
+    return """
+You are an aviation intelligence analyst monitoring NOTAMs (Notices to Airmen) for African airports on behalf of 14N Strategies.
+
+When asked to run a NOTAM report:
+
+1. Choose the source:
+   - Call `fetch_notams_autorouter()` for the Autorouter feed (no API key, broad coverage).
+   - Call `fetch_notams_skylink()` for the SkyLink feed (requires SKYLINK_API_KEY).
+   - If the user wants the fullest picture, call both and de-duplicate by `notam_id` per airport.
+
+2. Both tools accept an optional `icao_codes` list. Use it when the user names specific airports or a region; otherwise the default ~57 major African airports is used. `fetch_notams_autorouter` also accepts `start_validity` / `end_validity` as Unix timestamps to filter by active period.
+
+3. Read the response shape:
+   - `summary.total_notams`, `summary.active`, `summary.upcoming`
+   - `summary.by_category` (CLOSURE, MAINTENANCE, RESTRICTION, NAVIGATION, OBSTACLE, SERVICES, OTHER)
+   - `summary.by_airport`
+   - `notams[]` — full records with `airport_icao`, `notam_id`, `type` (N=new, R=replace, C=cancel), `effective_start`, `effective_end` (ISO 8601 or "PERM"), `text`, `category`, `is_active`, `is_upcoming`, `source`
+   - `fetch_errors[]` — airports the API failed for and why
+
+---
+
+STRUCTURE:
+
+**AVIATION INTELLIGENCE — African Airports | [report_date]**
+
+Open with one headline sentence: total active NOTAMs, the most operationally severe item (runway closure, airspace restriction, or security warning), and whether the picture is broadly stable or deteriorating. If `total_notams` is 0 across both sources, state that and stop.
+
+---
+
+**OPERATIONAL IMPACT — Active**
+NOTAMs where `is_active` is true. Group by airport, lead with the highest-impact categories in this order: CLOSURE → RESTRICTION → NAVIGATION → MAINTENANCE → OBSTACLE → SERVICES → OTHER.
+
+For each NOTAM:
+- **[ICAO] — [Category]** ([type code]; effective [start] → [end])
+- One sentence summarising the `text`, focused on operational consequence (what is closed, what is degraded, what airspace is restricted)
+- Source
+
+---
+
+**UPCOMING — Within Planning Horizon**
+NOTAMs where `is_upcoming` is true. Sort by `effective_start` ascending. Same per-item format as above, but lead with how soon they take effect.
+
+If none, omit this section.
+
+---
+
+**FETCH ERRORS**
+List any entries from `fetch_errors[]` so the reader knows which airports were not covered. One line each: `[ICAO] — [error]`.
+
+If none, omit this section.
+
+---
+
+**Sources**
+- **Autorouter** — community-curated NOTAM feed sourced from official AIPs. No API key. Broad European/African coverage; quality varies by FIR.
+- **SkyLink** — commercial NOTAM feed with parsed Q-codes and validity windows. Requires API key.
+
+---
+
+FORMATTING RULES:
+- Lead with operational severity, not feed-order. Closures and security NOTAMs first.
+- Treat `effective_end` of "PERM" as open-ended — say "permanent" rather than rendering the literal string.
+- Do not invent fields. If `text` is the only content available, summarise from it directly — do not infer Q-code subjects that are not present.
+- Suppress NOTAMs that are neither active nor upcoming (already expired) unless the user explicitly asks for historical view.
+- Keep each entry tight — analysts scan, they don't read.
+""".strip()
+
+
+NOTAMS_CACHE_DIR = Path("/data/cache") if Path("/data").exists() else Path("cache")
+NOTAMS_CACHE_DIR.mkdir(exist_ok=True)
+
+SKYLINK_API_KEY = os.getenv("SKYLINK_API_KEY", "")
+
+
+def _write_notams_cache(prefix: str, payload: dict) -> str:
+    date_label = datetime.utcnow().strftime("%d-%m-%y")
+    path = NOTAMS_CACHE_DIR / f"{prefix} {date_label}.json"
+    try:
+        with open(path, "w") as f:
+            json.dump(
+                {"timestamp": datetime.utcnow().isoformat(), "data": payload},
+                f,
+            )
+        return str(path)
+    except Exception as e:
+        logging.warning("Failed to write NOTAM cache %s: %s", path, e)
+        return ""
+
+
+@mcp.tool()
+async def fetch_notams_autorouter(
+    icao_codes: list[str] | None = None,
+    start_validity: int | None = None,
+    end_validity: int | None = None,
+) -> dict:
+    """Fetch NOTAMs from the Autorouter API for African airports.
+
+    No API key required. ICAO codes are processed in batches of 5 per request.
+    Per-airport failures are recorded under `fetch_errors` rather than aborting.
+    Results are also written to a date-stamped cache file.
+
+    Args:
+        icao_codes: List of ICAO airport codes. Defaults to ~55 major African airports.
+        start_validity: Optional Unix timestamp — only return NOTAMs active on/after this time.
+        end_validity: Optional Unix timestamp — only return NOTAMs active on/before this time.
+    """
+    codes = icao_codes if icao_codes else DEFAULT_AFRICAN_AIRPORTS
+    try:
+        report = await asyncio.wait_for(
+            fetch_autorouter_notams(codes, start_validity, end_validity),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        return {"error": "Autorouter NOTAM fetch timed out after 180 seconds"}
+
+    cache_path = _write_notams_cache("NOTAMs Autorouter", report)
+    if cache_path:
+        report["cache_file"] = cache_path
+    return report
+
+
+@mcp.tool()
+async def fetch_notams_skylink(icao_codes: list[str] | None = None) -> dict:
+    """Fetch NOTAMs from the SkyLink API for African airports.
+
+    Requires SKYLINK_API_KEY environment variable. One airport per request,
+    fetched concurrently with a small concurrency cap. Per-airport failures
+    are recorded under `fetch_errors`. Results are written to a date-stamped
+    cache file.
+
+    Args:
+        icao_codes: List of ICAO airport codes. Defaults to ~55 major African airports.
+    """
+    codes = icao_codes if icao_codes else DEFAULT_AFRICAN_AIRPORTS
+    try:
+        report = await asyncio.wait_for(
+            fetch_skylink_notams(codes, SKYLINK_API_KEY),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        return {"error": "SkyLink NOTAM fetch timed out after 180 seconds"}
+
+    if "error" in report and "notams" not in report:
+        return report
+
+    cache_path = _write_notams_cache("NOTAMs SkyLink", report)
+    if cache_path:
+        report["cache_file"] = cache_path
+    return report
 
 
 # ---------------------------------------------------------------------------

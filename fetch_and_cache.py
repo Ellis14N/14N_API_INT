@@ -6,6 +6,8 @@ MCP tools read from these files and return instantly, staying under the 60s time
 Cache files written (CACHE_DIR, named by UTC date):
     acled_conflicts_YYYY-MM-DD.json — ACLED trigger report for all 54 African countries
     travel_advisories_YYYY-MM-DD.json — Daily snapshot of travel advisories (FCDO, State Dept, DFAT, MEAE)
+    NOTAMs Autorouter DD-MM-YY.json — NOTAMs from Autorouter for major African airports
+    NOTAMs SkyLink DD-MM-YY.json — NOTAMs from SkyLink (requires SKYLINK_API_KEY)
 
 Note: travel advisories are independent of ACLED conflict data and are cached separately.
 """
@@ -274,6 +276,53 @@ async def cache_weather_report() -> None:
     logging.info("Wrote %s", path)
 
 
+async def cache_notams_autorouter() -> None:
+    from notams import DEFAULT_AFRICAN_AIRPORTS, fetch_autorouter_notams
+    logging.info("Caching Autorouter NOTAMs for %d airports...", len(DEFAULT_AFRICAN_AIRPORTS))
+    try:
+        report = await fetch_autorouter_notams(DEFAULT_AFRICAN_AIRPORTS)
+    except Exception as e:
+        logging.error("Autorouter NOTAMs cache failed: %s", e)
+        return
+    date_label = datetime.utcnow().strftime("%d-%m-%y")
+    path = CACHE_DIR / f"NOTAMs Autorouter {date_label}.json"
+    with open(path, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat(), "data": report}, f)
+    logging.info(
+        "Wrote %s — %d NOTAMs, %d errors",
+        path,
+        report.get("summary", {}).get("total_notams", 0),
+        len(report.get("fetch_errors", [])),
+    )
+
+
+async def cache_notams_skylink() -> None:
+    from notams import DEFAULT_AFRICAN_AIRPORTS, fetch_skylink_notams
+    api_key = os.getenv("SKYLINK_API_KEY", "")
+    if not api_key:
+        logging.warning("SKYLINK_API_KEY not set — skipping SkyLink NOTAMs cache")
+        return
+    logging.info("Caching SkyLink NOTAMs for %d airports...", len(DEFAULT_AFRICAN_AIRPORTS))
+    try:
+        report = await fetch_skylink_notams(DEFAULT_AFRICAN_AIRPORTS, api_key)
+    except Exception as e:
+        logging.error("SkyLink NOTAMs cache failed: %s", e)
+        return
+    if "error" in report and "notams" not in report:
+        logging.error("SkyLink NOTAMs returned error-only payload: %s", report.get("error"))
+        return
+    date_label = datetime.utcnow().strftime("%d-%m-%y")
+    path = CACHE_DIR / f"NOTAMs SkyLink {date_label}.json"
+    with open(path, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat(), "data": report}, f)
+    logging.info(
+        "Wrote %s — %d NOTAMs, %d errors",
+        path,
+        report.get("summary", {}).get("total_notams", 0),
+        len(report.get("fetch_errors", [])),
+    )
+
+
 async def cache_unhcr_report() -> None:
     from unhcr import fetch_unhcr_africa_report
     logging.info("Caching UNHCR displacement report for %d countries...", len(AFRICAN_CANONICAL_NAMES))
@@ -300,7 +349,13 @@ async def main() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", choices=["acled", "travel_advisories", "unhcr", "weather"])
+    parser.add_argument(
+        "--task",
+        choices=[
+            "acled", "travel_advisories", "unhcr", "weather",
+            "notams_autorouter", "notams_skylink",
+        ],
+    )
     args = parser.parse_args()
 
     if args.task == "acled":
@@ -311,5 +366,9 @@ if __name__ == "__main__":
         asyncio.run(cache_unhcr_report())
     elif args.task == "weather":
         asyncio.run(cache_weather_report())
+    elif args.task == "notams_autorouter":
+        asyncio.run(cache_notams_autorouter())
+    elif args.task == "notams_skylink":
+        asyncio.run(cache_notams_skylink())
     else:
         asyncio.run(main())

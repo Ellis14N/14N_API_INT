@@ -1,0 +1,80 @@
+name: Cache NOTAMs
+
+on:
+  schedule:
+    - cron: '5 22 * * *'  # 22:05 UTC + ~6hr GitHub delay = 04:05 Morocco (UTC+1)
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx python-dotenv
+
+      - name: Run Autorouter NOTAM cache job
+        run: python fetch_and_cache.py --task notams_autorouter
+
+      - name: Run SkyLink NOTAM cache job
+        env:
+          SKYLINK_API_KEY: ${{ secrets.SKYLINK_API_KEY }}
+        run: python fetch_and_cache.py --task notams_skylink
+
+      - name: Push cache files to data branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          DATE_LABEL=$(date -u +%d-%m-%y)
+          AUTOROUTER_FILE="cache/NOTAMs Autorouter ${DATE_LABEL}.json"
+          SKYLINK_FILE="cache/NOTAMs SkyLink ${DATE_LABEL}.json"
+
+          # At minimum the Autorouter file must exist (no key required).
+          # SkyLink is optional — skip if SKYLINK_API_KEY isn't configured.
+          if [ ! -f "$AUTOROUTER_FILE" ]; then
+            echo "Autorouter cache file not found: $AUTOROUTER_FILE"
+            ls cache/ || true
+            exit 1
+          fi
+
+          git fetch origin data:refs/remotes/origin/data 2>/dev/null || true
+
+          if git ls-remote --exit-code origin data >/dev/null 2>&1; then
+            git worktree add /tmp/data-branch data
+            git -C /tmp/data-branch pull origin data --rebase 2>/dev/null || true
+          else
+            git worktree add --orphan -b data /tmp/data-branch
+          fi
+
+          mkdir -p "/tmp/data-branch/cache"
+          cp "$AUTOROUTER_FILE" "/tmp/data-branch/${AUTOROUTER_FILE}"
+          if [ -f "$SKYLINK_FILE" ]; then
+            cp "$SKYLINK_FILE" "/tmp/data-branch/${SKYLINK_FILE}"
+          else
+            echo "SkyLink cache file not present (SKYLINK_API_KEY likely unset) — skipping"
+          fi
+
+          cd /tmp/data-branch
+          git add "${AUTOROUTER_FILE}"
+          if [ -f "${SKYLINK_FILE}" ]; then
+            git add "${SKYLINK_FILE}"
+          fi
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: notams cache ${DATE_LABEL}"
+          git push origin data
