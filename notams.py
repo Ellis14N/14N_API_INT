@@ -91,6 +91,20 @@ DEFAULT_AFRICAN_AIRPORTS: list[str] = [
 # ---------------------------------------------------------------------------
 # Categorisation
 # ---------------------------------------------------------------------------
+
+# Concise human-readable definition for each category. Shipped inside each
+# cache file so any consumer (the analyst prompt, dashboards, ad-hoc readers)
+# can render the same wording without duplicating it.
+CATEGORY_DEFINITIONS: dict[str, str] = {
+    "CLOSURE":     "Airport or runway fully closed.",
+    "MAINTENANCE": "Works, upgrades, construction, or resurfacing.",
+    "RESTRICTION": "Partial closure, reduced hours, weight limits, suspended procedures, prohibited areas, or traffic delays.",
+    "NAVIGATION":  "ILS, VOR, or nav aid outage.",
+    "OBSTACLE":    "Crane or temporary structure.",
+    "SERVICES":    "Fuel availability, ATC changes, or fire/rescue level changes.",
+    "OTHER":       "Does not fit the categories above.",
+}
+
 #
 # Categories (uppercase, fixed taxonomy):
 #   CLOSURE      — airport or runway fully closed
@@ -191,7 +205,8 @@ _KW_MAINTENANCE = ("maintenance", "maint ", " maint", "wip ", "work in progress"
                    "grading", "renovation")
 _KW_RESTRICTION = ("restricted", "restriction", "limited", "limitation", "reduced",
                    "displaced thr", "shortened", "weight limit", "mtow",
-                   "operational hours", "hours changed", "hr changed")
+                   "operational hours", "hours changed", "hr changed",
+                   "suspended", "prohibited area", "subj to dla", "subject to delay")
 
 
 def _classify_by_keywords(text: str) -> str:
@@ -610,6 +625,7 @@ def _build_report(
         "airports_queried": airports_queried,
         "airports_with_data": sorted(by_airport.keys()),
         "fetch_errors": fetch_errors,
+        "category_definitions": CATEGORY_DEFINITIONS,
         "summary": {
             "total_notams": len(notams),
             "active": active,

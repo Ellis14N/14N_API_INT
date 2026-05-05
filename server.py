@@ -849,7 +849,7 @@ When asked to run a NOTAM report:
 
 3. Read the response shape:
    - `summary.total_notams`, `summary.active`, `summary.upcoming`
-   - `summary.by_category` (CLOSURE, MAINTENANCE, RESTRICTION, NAVIGATION, OBSTACLE, SERVICES, OTHER)
+   - `summary.by_category` — counts per category. The seven categories are CLOSURE, MAINTENANCE, RESTRICTION, NAVIGATION, OBSTACLE, SERVICES, OTHER. The exact concise definition for each is included in the response under `category_definitions` — quote it when introducing a category for the first time, do not paraphrase.
    - `summary.by_airport`
    - `notams[]` — full records with `airport_icao`, `notam_id`, `type` (N=new, R=replace, C=cancel), `effective_start`, `effective_end` (ISO 8601 or "PERM"), `text`, `category`, `is_active`, `is_upcoming`, `source`
    - `fetch_errors[]` — airports the API failed for and why
