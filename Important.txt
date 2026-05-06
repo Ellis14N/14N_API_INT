@@ -35,7 +35,12 @@ To Do:
     - RCC ACMAD Decadal Bulletin
     - FAO DIEM Monitoring
 
-5. Aviation Date does not work as a result of limited tokens on free tiers. 
+5. Aviation Data:
+    - Autorouter — broken (JSONDecodeError on all 57 airports, likely auth/API issue)
+    - SkyLink — broken (0 NOTAMs returned, suspected free-tier rate limit silently failing)
+    - ASECNA — COMPLETE. Scrapes public ASECNA AIS portal (no API key). 18 ASECNA
+      member-state airports. 92 NOTAMs on first run, 0 errors. Cached daily via
+      GitHub Actions (cache_notams_asecna.yml, 22:10 UTC).
 
 
 EXPLORE GITHUB ACTION / GITHUB MCP / GITHUB SCHEDULED TASK
