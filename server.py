@@ -866,7 +866,9 @@ Open with one headline sentence: total active NOTAMs, the most operationally sev
 ---
 
 **OPERATIONAL IMPACT — Active**
-NOTAMs where `is_active` is true. Group by airport, lead with the highest-impact categories in this order: CLOSURE → RESTRICTION → NAVIGATION → MAINTENANCE → OBSTACLE → SERVICES → OTHER.
+NOTAMs where `is_active` is true. Group by airport, lead with the five disruption-relevant categories in this order: CLOSURE → RESTRICTION → NAVIGATION → MAINTENANCE → SERVICES. These five define operational disruption (closures, partial restrictions, nav-aid outages, works, fuel/ATC/rescue changes).
+
+OBSTACLE and OTHER are situational-awareness items only — not disruption. Suppress them by default; only surface them if the user explicitly asks for "all NOTAMs", "obstacles", or "everything".
 
 For each NOTAM:
 - **[ICAO] — [Category]** ([type code]; effective [start] → [end])
