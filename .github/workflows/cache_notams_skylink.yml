@@ -1,0 +1,66 @@
+name: Cache NOTAMs (SkyLink)
+
+on:
+  schedule:
+    - cron: '5 22 * * *'  # 22:05 UTC + ~6hr GitHub delay = 04:05 Morocco (UTC+1)
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx python-dotenv
+
+      - name: Run SkyLink NOTAM cache job
+        env:
+          SKYLINK_API_KEY: ${{ secrets.SKYLINK_API_KEY }}
+        run: python fetch_and_cache.py --task notams_skylink
+
+      - name: Push SkyLink cache file to data branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          DATE_LABEL=$(date -u +%d-%m-%y)
+          SKYLINK_FILE="cache/NOTAMs SkyLink ${DATE_LABEL}.json"
+
+          if [ ! -f "$SKYLINK_FILE" ]; then
+            echo "SkyLink cache file not produced — failing the run"
+            ls cache/ || true
+            exit 1
+          fi
+
+          git fetch origin data:refs/remotes/origin/data 2>/dev/null || true
+
+          if git ls-remote --exit-code origin data >/dev/null 2>&1; then
+            git worktree add /tmp/data-branch data
+            git -C /tmp/data-branch pull origin data --rebase 2>/dev/null || true
+          else
+            git worktree add --orphan -b data /tmp/data-branch
+          fi
+
+          mkdir -p "/tmp/data-branch/cache"
+          cp "$SKYLINK_FILE" "/tmp/data-branch/${SKYLINK_FILE}"
+
+          cd /tmp/data-branch
+          git add "${SKYLINK_FILE}"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: skylink notams cache ${DATE_LABEL}"
+          git push origin data
