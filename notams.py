@@ -277,14 +277,32 @@ def categorize_notam(text: str, qcode: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 def _to_iso(value) -> str:
-    """Coerce assorted date inputs to ISO 8601 UTC, or 'PERM' for permanent."""
+    """Coerce assorted date inputs to ISO 8601 UTC, or 'PERM' for permanent.
+
+    Recognised string formats:
+      - "PERM" / "PERMANENT" → "PERM"
+      - 12-digit YYYYMMDDHHMM (SkyLink format)
+      - 10-digit YYMMDDHHMM (legacy NOTAM ICAO format)
+      - ISO 8601
+    Trailing "EST" / "EST." (NOTAM "estimated" marker) is stripped before parsing.
+    """
     if value is None or value == "":
         return ""
     if isinstance(value, str):
-        s = value.strip()
-        if s.upper() in ("PERM", "PERMANENT"):
+        s = value.strip().upper()
+        if s in ("PERM", "PERMANENT"):
             return "PERM"
-        # NOTAM raw 10-digit YYMMDDHHMM
+        # Strip NOTAM-specific suffixes like "EST" (estimated end time)
+        s = re.sub(r"\s*EST\.?$", "", s)
+        # 12-digit YYYYMMDDHHMM (what SkyLink returns)
+        m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})", s)
+        if m:
+            yyyy, mm, dd, hh, mn = (int(x) for x in m.groups())
+            try:
+                return datetime(yyyy, mm, dd, hh, mn, tzinfo=timezone.utc).isoformat()
+            except ValueError:
+                return s
+        # 10-digit YYMMDDHHMM (legacy NOTAM ICAO format)
         m = re.fullmatch(r"(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", s)
         if m:
             yy, mm, dd, hh, mn = (int(x) for x in m.groups())
@@ -582,42 +600,44 @@ async def fetch_autorouter_notams(
 # ---------------------------------------------------------------------------
 
 def _normalize_skylink(item: dict, fallback_icao: str) -> dict | None:
+    """Map a SkyLink NOTAM record (RapidAPI listing) to the canonical schema.
+
+    SkyLink returns each NOTAM as:
+      {
+        "raw": "!FAOR A1231/2026 ... 202604180400 202604180600",
+        "notam_id": "A1231/2026",
+        "type": "N" | "R" | "C",
+        "location": "FAOR",
+        "effective":  "YYYYMMDDHHMM",          # 12-digit
+        "expiration": "YYYYMMDDHHMM" | "...EST" | "PERM",
+        "body": "..."                           # NOTAM text without headers
+      }
+    """
     if not isinstance(item, dict):
         return None
+
     icao = (
-        item.get("icao")
+        item.get("location")
+        or item.get("icao")
         or item.get("airport_icao")
-        or item.get("location")
         or fallback_icao
         or ""
     ).strip().upper()
 
-    notam_id = (
-        item.get("notam_id")
-        or item.get("id")
-        or item.get("ident")
-        or ""
-    )
+    notam_id = item.get("notam_id") or item.get("id") or item.get("ident") or ""
 
     type_raw = (item.get("type") or item.get("notam_type") or "").strip().upper()
     type_code = type_raw[0] if type_raw and type_raw[0] in ("N", "R", "C") else type_raw
 
-    start = _to_iso(
-        item.get("effective_start")
-        or item.get("start")
-        or item.get("valid_from")
-    )
-    end_raw = (
-        item.get("effective_end")
-        or item.get("end")
-        or item.get("valid_to")
-    )
+    start = _to_iso(item.get("effective"))
+    end_raw = item.get("expiration")
     if isinstance(end_raw, str) and end_raw.strip().upper() in ("PERM", "PERMANENT"):
         end = "PERM"
     else:
         end = _to_iso(end_raw)
 
-    text = item.get("text") or item.get("body") or item.get("raw") or ""
+    # Prefer `body` (NOTAM text without ident/header) over `raw` (full line including ID + dates)
+    text = item.get("body") or item.get("raw") or item.get("text") or ""
     qcode = item.get("qcode") or item.get("q_code") or None
 
     is_active, is_upcoming = _compute_active_upcoming(start, end)

@@ -28,21 +28,6 @@ jobs:
       - name: Install dependencies
         run: pip install httpx python-dotenv
 
-      # TEMPORARY: dump one raw SkyLink response so we can identify the actual
-      # field names for effective_start / effective_end / issued. Remove after
-      # the normaliser has been patched with the real keys.
-      - name: Debug — dump one raw SkyLink response (FAOR)
-        env:
-          SKYLINK_API_KEY: ${{ secrets.SKYLINK_API_KEY }}
-        run: |
-          echo "=== Raw SkyLink response for FAOR (first 2 NOTAMs) ==="
-          curl -sS \
-            -H "X-RapidAPI-Key: $SKYLINK_API_KEY" \
-            -H "X-RapidAPI-Host: skylink-api.p.rapidapi.com" \
-            "https://skylink-api.p.rapidapi.com/notams/FAOR?limit=2" \
-            | python3 -m json.tool || echo "(non-JSON or curl failed)"
-          echo "=== End of raw response ==="
-
       - name: Run SkyLink NOTAM cache job
         env:
           SKYLINK_API_KEY: ${{ secrets.SKYLINK_API_KEY }}
