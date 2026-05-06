@@ -48,10 +48,15 @@ jobs:
           AUTOROUTER_FILE="cache/NOTAMs Autorouter ${DATE_LABEL}.json"
           SKYLINK_FILE="cache/NOTAMs SkyLink ${DATE_LABEL}.json"
 
-          # At minimum the Autorouter file must exist (no key required).
-          # SkyLink is optional — skip if SKYLINK_API_KEY isn't configured.
-          if [ ! -f "$AUTOROUTER_FILE" ]; then
-            echo "Autorouter cache file not found: $AUTOROUTER_FILE"
+          # Both files are optional; the run fails only if NEITHER was produced.
+          # Autorouter requires an approved support ticket; SkyLink requires
+          # the RapidAPI key + remaining quota. Either source alone is enough.
+          HAS_AUTO=0; HAS_SKY=0
+          [ -f "$AUTOROUTER_FILE" ] && HAS_AUTO=1 || echo "Autorouter cache file not produced (auth pending or fetch failed) — skipping"
+          [ -f "$SKYLINK_FILE" ]    && HAS_SKY=1  || echo "SkyLink cache file not produced (key unset or quota exhausted) — skipping"
+
+          if [ $HAS_AUTO -eq 0 ] && [ $HAS_SKY -eq 0 ]; then
+            echo "Neither NOTAM cache file was produced — nothing to publish"
             ls cache/ || true
             exit 1
           fi
@@ -66,18 +71,16 @@ jobs:
           fi
 
           mkdir -p "/tmp/data-branch/cache"
-          cp "$AUTOROUTER_FILE" "/tmp/data-branch/${AUTOROUTER_FILE}"
-          if [ -f "$SKYLINK_FILE" ]; then
+          if [ $HAS_AUTO -eq 1 ]; then
+            cp "$AUTOROUTER_FILE" "/tmp/data-branch/${AUTOROUTER_FILE}"
+          fi
+          if [ $HAS_SKY -eq 1 ]; then
             cp "$SKYLINK_FILE" "/tmp/data-branch/${SKYLINK_FILE}"
-          else
-            echo "SkyLink cache file not present (SKYLINK_API_KEY likely unset) — skipping"
           fi
 
           cd /tmp/data-branch
-          git add "${AUTOROUTER_FILE}"
-          if [ -f "${SKYLINK_FILE}" ]; then
-            git add "${SKYLINK_FILE}"
-          fi
+          [ $HAS_AUTO -eq 1 ] && git add "${AUTOROUTER_FILE}"
+          [ $HAS_SKY  -eq 1 ] && git add "${SKYLINK_FILE}"
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "chore: notams cache ${DATE_LABEL}"
           git push origin data
