@@ -1,0 +1,64 @@
+name: Cache NOTAMs (ASECNA)
+
+on:
+  schedule:
+    - cron: '10 22 * * *'  # 22:10 UTC daily (offset from other NOTAM jobs)
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx python-dotenv
+
+      - name: Run ASECNA NOTAM cache job
+        run: python fetch_and_cache.py --task notams_asecna
+
+      - name: Push ASECNA cache file to data branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          DATE_LABEL=$(date -u +%d-%m-%y)
+          ASECNA_FILE="cache/NOTAMs ASECNA ${DATE_LABEL}.json"
+
+          if [ ! -f "$ASECNA_FILE" ]; then
+            echo "ASECNA cache file not produced — failing the run"
+            ls cache/ || true
+            exit 1
+          fi
+
+          git fetch origin data:refs/remotes/origin/data 2>/dev/null || true
+
+          if git ls-remote --exit-code origin data >/dev/null 2>&1; then
+            git worktree add /tmp/data-branch data
+            git -C /tmp/data-branch pull origin data --rebase 2>/dev/null || true
+          else
+            git worktree add --orphan -b data /tmp/data-branch
+          fi
+
+          mkdir -p "/tmp/data-branch/cache"
+          cp "$ASECNA_FILE" "/tmp/data-branch/${ASECNA_FILE}"
+
+          cd /tmp/data-branch
+          git add "${ASECNA_FILE}"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: asecna notams cache ${DATE_LABEL}"
+          git push origin data

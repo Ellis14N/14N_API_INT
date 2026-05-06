@@ -1,10 +1,11 @@
 """
-NOTAM fetching for African airports via Autorouter and SkyLink APIs.
+NOTAM fetching for African airports via Autorouter, SkyLink, and ASECNA.
 
-Two providers, same normalized schema. Per-airport failures are recorded in
+Three providers, same normalized schema. Per-airport failures are recorded in
 `fetch_errors` rather than aborting the run.
 """
 import asyncio
+from html import unescape as _html_unescape
 import json
 import logging
 import re
@@ -31,6 +32,11 @@ SKYLINK_LIMIT = 50
 # RapidAPI free tiers cap at ~1 req/s. Stay sequential and pace ourselves.
 SKYLINK_DELAY_S = 1.2
 SKYLINK_RETRY_DELAY_S = 5.0
+
+# ASECNA — public portal, no API key, POST form, HTML response.
+ASECNA_URL = "https://ais.asecna.aero/en/ntm/notam.php"
+ASECNA_DELAY_S = 0.5   # polite pacing; no documented rate limit
+ASECNA_MAX_ROWS = 400
 
 # Recency filter: keep only NOTAMs whose effective_start is within ±N days of
 # now. Drops both stale (long-running) NOTAMs and far-future scheduled ones.
@@ -96,6 +102,29 @@ DEFAULT_AFRICAN_AIRPORTS: list[str] = [
     "HUEN",  # Entebbe, Uganda
     "FLKK",  # Lusaka, Zambia
     "FVHA",  # Harare, Zimbabwe
+]
+
+# ASECNA member-state airports only (subset of DEFAULT_AFRICAN_AIRPORTS).
+# Querying non-member airports returns empty — no point sending those requests.
+ASECNA_AIRPORTS: list[str] = [
+    "DBBB",  # Cotonou, Benin
+    "DFFD",  # Ouagadougou, Burkina Faso
+    "FKYS",  # Yaoundé, Cameroon
+    "FEFF",  # Bangui, Central African Republic
+    "FTTJ",  # N'Djamena, Chad
+    "FMCH",  # Moroni, Comoros
+    "FCBB",  # Brazzaville, Congo
+    "DIAP",  # Abidjan, Ivory Coast
+    "FGSL",  # Malabo, Equatorial Guinea
+    "FOOL",  # Libreville, Gabon
+    "GBYD",  # Banjul, Gambia
+    "GGOV",  # Bissau, Guinea-Bissau
+    "FMMI",  # Antananarivo, Madagascar
+    "GABS",  # Bamako, Mali
+    "GQNN",  # Nouakchott, Mauritania
+    "DRRN",  # Niamey, Niger
+    "GOBD",  # Dakar, Senegal
+    "DXXX",  # Lomé, Togo
 ]
 
 
@@ -763,6 +792,172 @@ async def fetch_skylink_notams(
             notams.append(norm)
 
     return _build_report(notams, codes, fetch_errors, source="skylink", window_days=window_days)
+
+
+# ---------------------------------------------------------------------------
+# ASECNA
+# ---------------------------------------------------------------------------
+
+
+def _asecna_strip_html(fragment: str) -> str:
+    """Replace <BR> with newlines, remove all other tags, unescape HTML entities."""
+    s = re.sub(r'<[Bb][Rr]\s*/?>', '\n', fragment)
+    s = re.sub(r'<[^>]+>', '', s)
+    return _html_unescape(s)
+
+
+def _parse_asecna_page(html: str) -> list[str]:
+    """Extract raw NOTAM text blocks from an ASECNA HTML response."""
+    blocks = re.findall(
+        r'<div\s+id=["\']notam["\'][^>]*>(.*?)</div>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    result = []
+    for block in blocks:
+        text = _asecna_strip_html(block)
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _normalize_asecna(raw_text: str, fallback_icao: str) -> dict | None:
+    """Map a single ASECNA NOTAM text block to the canonical schema.
+
+    ASECNA NOTAM structure (after HTML-stripping):
+      GOOOYNYX
+      (A0220/26 NOTAMR A1276/25
+      Q)GOOO/QMAHG/IV/BO/A/000/999/1440N01704W 005
+      A)GOBD B)2026-03-06 15:13:00  C)2026-06-02 23:59:00 EST
+      E)GRASS CUTTING IN PROGRESS...
+    """
+    id_m = re.search(r'\(([A-Z]\d{4}/\d{2,4})\s+NOTAM([NRC])', raw_text)
+    if not id_m:
+        return None
+    notam_id = id_m.group(1)
+    type_code = id_m.group(2)
+
+    # Q-code: second slash-delimited field, e.g. "GOOO/QMAHG/IV/..."
+    q_m = re.search(r'\bQ\)(\S+)', raw_text)
+    qcode = None
+    if q_m:
+        parts = q_m.group(1).split('/')
+        if len(parts) >= 2 and parts[1].upper().startswith('Q'):
+            qcode = parts[1].upper()
+
+    # A) — affected aerodrome
+    a_m = re.search(r'\bA\)\s*([A-Z]{4})\b', raw_text)
+    icao = a_m.group(1) if a_m else fallback_icao.strip().upper()
+
+    # B) — start datetime  "YYYY-MM-DD HH:MM:SS" (UTC)
+    b_m = re.search(r'\bB\)\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})', raw_text)
+    start_iso = _to_iso(f"{b_m.group(1)}T{b_m.group(2)}+00:00") if b_m else ""
+
+    # C) — end datetime; "0000-00-00 … PERM" means permanent
+    c_m = re.search(r'\bC\)\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})(\s+\S+)?', raw_text)
+    if c_m:
+        date_p, time_p = c_m.group(1), c_m.group(2)
+        suffix = (c_m.group(3) or "").strip().upper()
+        if 'PERM' in suffix or date_p.startswith('0000'):
+            end_iso = "PERM"
+        else:
+            end_iso = _to_iso(f"{date_p}T{time_p}+00:00")
+    else:
+        end_iso = ""
+
+    # E) — free-text body (may be multi-line); strip trailing ")" from NOTAM envelope
+    e_m = re.search(r'\bE\)\s*(.+?)(?:\)\s*$|\Z)', raw_text, re.DOTALL)
+    if e_m:
+        body = re.sub(r'\s+', ' ', e_m.group(1)).strip()
+    else:
+        body = ""
+
+    is_active, is_upcoming = _compute_active_upcoming(start_iso, end_iso)
+    return {
+        "airport_icao": icao,
+        "notam_id": notam_id,
+        "type": type_code,
+        "effective_start": start_iso,
+        "effective_end": end_iso,
+        "text": body,
+        "category": categorize_notam(body, qcode),
+        "is_active": is_active,
+        "is_upcoming": is_upcoming,
+        "source": "asecna",
+    }
+
+
+async def _fetch_asecna_one(
+    client: httpx.AsyncClient,
+    icao: str,
+) -> tuple[str, list[str] | Exception]:
+    """POST to ASECNA portal for one ICAO code; return parsed text blocks."""
+    data = {
+        "qr_bni":      "TOUT",
+        "qr_qfir":     "TOUT",
+        "qr_firx":     icao,
+        "qr_num":      "",
+        "qr_perm":     "",
+        "qr_datearrd": "",
+        "qr_datearrf": "",
+        "qr_datevald": "",
+        "qr_datevalf": "",
+        "qr_texte":    "",
+        "qr_maxrows":  str(ASECNA_MAX_ROWS),
+        "submit":      "Consulter",
+    }
+    try:
+        resp = await client.post(ASECNA_URL, data=data)
+        resp.raise_for_status()
+        return icao, _parse_asecna_page(resp.text)
+    except Exception as e:
+        return icao, e
+
+
+async def fetch_asecna_notams(
+    icao_codes: Iterable[str] | None = None,
+    window_days: int = RECENT_WINDOW_DAYS,
+) -> dict:
+    """Fetch NOTAMs from the ASECNA public portal (no API key required).
+
+    Covers airports in ASECNA member states (18 francophone African countries +
+    Madagascar). Requests are sequential with light pacing. Per-airport failures
+    are recorded under `fetch_errors` rather than aborting the run.
+
+    Args:
+        icao_codes: ICAO codes to query. Defaults to ASECNA_AIRPORTS (~18 airports).
+        window_days: Keep NOTAMs that are currently active OR whose effective_start
+            is within ±N days of now (default 7).
+    """
+    codes = [c.strip().upper() for c in (icao_codes or ASECNA_AIRPORTS) if c and c.strip()]
+    notams: list[dict] = []
+    fetch_errors: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    headers = {"User-Agent": "14N-API-INT/1.0"}
+    async with httpx.AsyncClient(timeout=30, headers=headers) as client:
+        for i, icao in enumerate(codes):
+            if i > 0:
+                await asyncio.sleep(ASECNA_DELAY_S)
+            icao_out, outcome = await _fetch_asecna_one(client, icao)
+            if isinstance(outcome, Exception):
+                fetch_errors.append({"icao": icao_out, "error": f"{type(outcome).__name__}: {outcome}"})
+                continue
+            for raw_text in outcome:
+                norm = _normalize_asecna(raw_text, fallback_icao=icao_out)
+                if not norm or not norm["airport_icao"]:
+                    continue
+                if not _passes_recency_filter(norm, window_days):
+                    continue
+                key = (norm["airport_icao"], norm["notam_id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                notams.append(norm)
+
+    return _build_report(notams, codes, fetch_errors, source="asecna", window_days=window_days)
 
 
 # ---------------------------------------------------------------------------

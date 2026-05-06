@@ -8,6 +8,7 @@ Cache files written (CACHE_DIR, named by UTC date):
     travel_advisories_YYYY-MM-DD.json — Daily snapshot of travel advisories (FCDO, State Dept, DFAT, MEAE)
     NOTAMs Autorouter DD-MM-YY.json — NOTAMs from Autorouter for major African airports
     NOTAMs SkyLink DD-MM-YY.json — NOTAMs from SkyLink (requires SKYLINK_API_KEY)
+    NOTAMs ASECNA DD-MM-YY.json — NOTAMs from ASECNA portal for 18 francophone African countries
 
 Note: travel advisories are independent of ACLED conflict data and are cached separately.
 """
@@ -336,6 +337,29 @@ async def cache_notams_skylink() -> None:
     )
 
 
+async def cache_notams_asecna() -> None:
+    from notams import ASECNA_AIRPORTS, fetch_asecna_notams
+    logging.info("Caching ASECNA NOTAMs for %d airports...", len(ASECNA_AIRPORTS))
+    try:
+        report = await fetch_asecna_notams(ASECNA_AIRPORTS)
+    except Exception as e:
+        logging.error("ASECNA NOTAMs cache failed: %s", e)
+        return
+    if "error" in report and "notams" not in report:
+        logging.error("ASECNA NOTAMs returned error-only payload: %s", report.get("error"))
+        return
+    date_label = datetime.utcnow().strftime("%d-%m-%y")
+    path = CACHE_DIR / f"NOTAMs ASECNA {date_label}.json"
+    with open(path, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat(), "data": report}, f)
+    logging.info(
+        "Wrote %s — %d NOTAMs, %d errors",
+        path,
+        report.get("summary", {}).get("total_notams", 0),
+        len(report.get("fetch_errors", [])),
+    )
+
+
 async def cache_unhcr_report() -> None:
     from unhcr import fetch_unhcr_africa_report
     logging.info("Caching UNHCR displacement report for %d countries...", len(AFRICAN_CANONICAL_NAMES))
@@ -366,7 +390,7 @@ if __name__ == "__main__":
         "--task",
         choices=[
             "acled", "travel_advisories", "unhcr", "weather",
-            "notams_autorouter", "notams_skylink",
+            "notams_autorouter", "notams_skylink", "notams_asecna",
         ],
     )
     args = parser.parse_args()
@@ -383,5 +407,7 @@ if __name__ == "__main__":
         asyncio.run(cache_notams_autorouter())
     elif args.task == "notams_skylink":
         asyncio.run(cache_notams_skylink())
+    elif args.task == "notams_asecna":
+        asyncio.run(cache_notams_asecna())
     else:
         asyncio.run(main())

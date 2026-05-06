@@ -842,11 +842,12 @@ You are an aviation intelligence analyst monitoring NOTAMs (Notices to Airmen) f
 When asked to run a NOTAM report:
 
 1. Choose the source:
-   - Call `fetch_notams_autorouter()` for the Autorouter feed (no API key, broad coverage).
+   - Call `fetch_notams_asecna()` for ASECNA member-state airports (18 francophone African countries + Madagascar). Public portal, no API key. Best coverage for West/Central Africa.
+   - Call `fetch_notams_autorouter()` for the Autorouter feed (no API key, broad pan-African coverage).
    - Call `fetch_notams_skylink()` for the SkyLink feed (requires SKYLINK_API_KEY).
-   - If the user wants the fullest picture, call both and de-duplicate by `notam_id` per airport.
+   - For the fullest picture of West/Central Africa, combine ASECNA + Autorouter and de-duplicate by `notam_id` per airport. For continent-wide coverage, add SkyLink.
 
-2. Both tools accept an optional `icao_codes` list. Use it when the user names specific airports or a region; otherwise the default ~57 major African airports is used. `fetch_notams_autorouter` also accepts `start_validity` / `end_validity` as Unix timestamps to filter by active period.
+2. All three tools accept an optional `icao_codes` list. Use it when the user names specific airports or a region; otherwise defaults are used (~18 airports for ASECNA, ~57 for Autorouter/SkyLink). `fetch_notams_autorouter` also accepts `start_validity` / `end_validity` as Unix timestamps to filter by active period.
 
 3. Read the response shape:
    - `summary.total_notams`, `summary.active`, `summary.upcoming`
@@ -892,7 +893,8 @@ If none, omit this section.
 ---
 
 **Sources**
-- **Autorouter** — community-curated NOTAM feed sourced from official AIPs. No API key. Broad European/African coverage; quality varies by FIR.
+- **ASECNA** — official AIS portal for 18 francophone African countries + Madagascar. Public, no API key. Authoritative for West/Central Africa.
+- **Autorouter** — community-curated NOTAM feed sourced from official AIPs. No API key. Broad pan-African coverage; quality varies by FIR.
 - **SkyLink** — commercial NOTAM feed with parsed Q-codes and validity windows. Requires API key.
 
 ---
@@ -1013,6 +1015,43 @@ async def fetch_notams_skylink(
         return report
 
     cache_path = _write_notams_cache("NOTAMs SkyLink", report)
+    if cache_path:
+        report["cache_file"] = cache_path
+    return report
+
+
+@mcp.tool()
+async def fetch_notams_asecna(
+    icao_codes: list[str] | None = None,
+    recent_days: int = RECENT_WINDOW_DAYS,
+) -> dict:
+    """Fetch NOTAMs from the ASECNA public portal for ASECNA member-state airports.
+
+    ASECNA (Agence pour la Sécurité de la Navigation Aérienne en Afrique et à
+    Madagascar) covers 18 francophone African countries + Madagascar. The portal
+    is public — no API key required. Requests are made one airport at a time
+    with light pacing. Per-airport failures are recorded under `fetch_errors`.
+    Results are written to a date-stamped cache file.
+
+    Args:
+        icao_codes: List of ICAO airport codes. Defaults to ~18 ASECNA member-state airports.
+        recent_days: Recency window in days. A NOTAM is kept if it is currently
+            active OR its effective_start is within ±N days of now (default 7).
+    """
+    from notams import ASECNA_AIRPORTS, fetch_asecna_notams
+    codes = icao_codes if icao_codes else ASECNA_AIRPORTS
+    try:
+        report = await asyncio.wait_for(
+            fetch_asecna_notams(codes, window_days=recent_days),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        return {"error": "ASECNA NOTAM fetch timed out after 180 seconds"}
+
+    if "error" in report and "notams" not in report:
+        return report
+
+    cache_path = _write_notams_cache("NOTAMs ASECNA", report)
     if cache_path:
         report["cache_file"] = cache_path
     return report
