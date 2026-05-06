@@ -949,9 +949,11 @@ async def fetch_notams_autorouter(
         icao_codes: List of ICAO airport codes. Defaults to ~57 major African airports.
         start_validity: Optional Unix timestamp — only return NOTAMs active on/after this time.
         end_validity: Optional Unix timestamp — only return NOTAMs active on/before this time.
-        recent_days: Recency window in days; only NOTAMs whose effective_start
-            is within ±N days of now are kept (default 7). Pass a large value
-            (e.g. 365) to effectively disable the filter.
+        recent_days: Recency window in days. A NOTAM is kept if it is
+            currently active OR its effective_start is within ±N days of now
+            (default 7). Pass 0 to keep only NOTAMs whose effective_start is
+            on/around today; pass a large value (e.g. 365) to effectively
+            disable the recency half (active NOTAMs are always kept).
     """
     codes = icao_codes if icao_codes else DEFAULT_AFRICAN_AIRPORTS
     try:
@@ -992,9 +994,11 @@ async def fetch_notams_skylink(
 
     Args:
         icao_codes: List of ICAO airport codes. Defaults to ~57 major African airports.
-        recent_days: Recency window in days; only NOTAMs whose effective_start
-            is within ±N days of now are kept (default 7). Pass a large value
-            (e.g. 365) to effectively disable the filter.
+        recent_days: Recency window in days. A NOTAM is kept if it is
+            currently active OR its effective_start is within ±N days of now
+            (default 7). Pass 0 to keep only NOTAMs whose effective_start is
+            on/around today; pass a large value (e.g. 365) to effectively
+            disable the recency half (active NOTAMs are always kept).
     """
     codes = icao_codes if icao_codes else DEFAULT_AFRICAN_AIRPORTS
     try:

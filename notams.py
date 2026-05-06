@@ -346,6 +346,20 @@ def _is_within_recent_window(start_iso: str, window_days: int) -> bool:
     return abs((start - now).total_seconds()) <= window_days * 86400
 
 
+def _passes_recency_filter(notam: dict, window_days: int) -> bool:
+    """Keep a NOTAM if it is currently active OR its effective_start is
+    within ±window_days of now.
+
+    The OR captures three operationally relevant states:
+      - currently active (any duration — long-running NOTAMs are kept)
+      - recently activated within the window
+      - about to start within the window
+    """
+    if notam.get("is_active"):
+        return True
+    return _is_within_recent_window(notam.get("effective_start", ""), window_days)
+
+
 def _compute_active_upcoming(start_iso: str, end_iso: str) -> tuple[bool, bool]:
     now = datetime.now(timezone.utc)
     start = None
@@ -526,8 +540,12 @@ async def fetch_autorouter_notams(
     """Fetch NOTAMs from Autorouter, batching ICAO codes 5 per request.
 
     `client_id` is the account email and `client_secret` is the password (per
-    Autorouter's OAuth2 client_credentials flow). `window_days` keeps only
-    NOTAMs whose effective_start is within ±N days of now (default 7).
+    Autorouter's OAuth2 client_credentials flow).
+
+    `window_days` (default 7) drives the operational-relevance filter: a NOTAM
+    is kept if it is currently active OR its effective_start is within ±N days
+    of now. This captures recently activated, currently active, and upcoming
+    NOTAMs in one filter.
     """
     if not client_id or not client_secret:
         return {
@@ -583,8 +601,8 @@ async def fetch_autorouter_notams(
                 # Filter to requested batch (defensive — itema may include neighbours)
                 if norm["airport_icao"] not in batch:
                     continue
-                # Recency filter — drop NOTAMs whose effective_start is outside ±window_days
-                if not _is_within_recent_window(norm["effective_start"], window_days):
+                # Keep if currently active OR effective_start is within ±window_days
+                if not _passes_recency_filter(norm, window_days):
                     continue
                 key = (norm["airport_icao"], norm["notam_id"])
                 if key in seen:
@@ -697,8 +715,10 @@ async def fetch_skylink_notams(
 ) -> dict:
     """Fetch NOTAMs from SkyLink, one airport per request, capped concurrency.
 
-    `window_days` keeps only NOTAMs whose effective_start is within ±N days
-    of now (default 7).
+    `window_days` (default 7) drives the operational-relevance filter: a NOTAM
+    is kept if it is currently active OR its effective_start is within ±N days
+    of now. This captures recently activated, currently active, and upcoming
+    NOTAMs in one filter.
     """
     if not api_key:
         return {
@@ -733,8 +753,8 @@ async def fetch_skylink_notams(
             norm = _normalize_skylink(raw, fallback_icao=icao)
             if not norm or not norm["airport_icao"]:
                 continue
-            # Recency filter — drop NOTAMs whose effective_start is outside ±window_days
-            if not _is_within_recent_window(norm["effective_start"], window_days):
+            # Keep if currently active OR effective_start is within ±window_days
+            if not _passes_recency_filter(norm, window_days):
                 continue
             key = (norm["airport_icao"], norm["notam_id"])
             if key in seen:
