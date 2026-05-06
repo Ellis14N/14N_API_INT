@@ -29,6 +29,9 @@ jobs:
         run: pip install httpx python-dotenv
 
       - name: Run Autorouter NOTAM cache job
+        env:
+          AUTOROUTER_CLIENT_ID: ${{ secrets.AUTOROUTER_CLIENT_ID }}
+          AUTOROUTER_CLIENT_SECRET: ${{ secrets.AUTOROUTER_CLIENT_SECRET }}
         run: python fetch_and_cache.py --task notams_autorouter
 
       - name: Run SkyLink NOTAM cache job

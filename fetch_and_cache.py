@@ -278,11 +278,24 @@ async def cache_weather_report() -> None:
 
 async def cache_notams_autorouter() -> None:
     from notams import DEFAULT_AFRICAN_AIRPORTS, fetch_autorouter_notams
+    client_id = os.getenv("AUTOROUTER_CLIENT_ID", "")
+    client_secret = os.getenv("AUTOROUTER_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        logging.warning(
+            "AUTOROUTER_CLIENT_ID/AUTOROUTER_CLIENT_SECRET not set — "
+            "skipping Autorouter NOTAMs cache"
+        )
+        return
     logging.info("Caching Autorouter NOTAMs for %d airports...", len(DEFAULT_AFRICAN_AIRPORTS))
     try:
-        report = await fetch_autorouter_notams(DEFAULT_AFRICAN_AIRPORTS)
+        report = await fetch_autorouter_notams(
+            DEFAULT_AFRICAN_AIRPORTS, client_id, client_secret,
+        )
     except Exception as e:
         logging.error("Autorouter NOTAMs cache failed: %s", e)
+        return
+    if "error" in report and "notams" not in report:
+        logging.error("Autorouter returned error-only payload: %s", report.get("error"))
         return
     date_label = datetime.utcnow().strftime("%d-%m-%y")
     path = CACHE_DIR / f"NOTAMs Autorouter {date_label}.json"

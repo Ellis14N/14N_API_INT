@@ -907,6 +907,8 @@ NOTAMS_CACHE_DIR = Path("/data/cache") if Path("/data").exists() else Path("cach
 NOTAMS_CACHE_DIR.mkdir(exist_ok=True)
 
 SKYLINK_API_KEY = os.getenv("SKYLINK_API_KEY", "")
+AUTOROUTER_CLIENT_ID = os.getenv("AUTOROUTER_CLIENT_ID", "")
+AUTOROUTER_CLIENT_SECRET = os.getenv("AUTOROUTER_CLIENT_SECRET", "")
 
 
 def _write_notams_cache(prefix: str, payload: dict) -> str:
@@ -932,9 +934,12 @@ async def fetch_notams_autorouter(
 ) -> dict:
     """Fetch NOTAMs from the Autorouter API for African airports.
 
-    No API key required. ICAO codes are processed in batches of 5 per request.
-    Per-airport failures are recorded under `fetch_errors` rather than aborting.
-    Results are also written to a date-stamped cache file.
+    Requires `AUTOROUTER_CLIENT_ID` (account email) and `AUTOROUTER_CLIENT_SECRET`
+    (account password) environment variables — Autorouter uses an OAuth2
+    client_credentials flow with a 1-hour token TTL. ICAO codes are processed
+    in batches of 5 per request. Per-airport failures are recorded under
+    `fetch_errors` rather than aborting. Results are also written to a
+    date-stamped cache file.
 
     Args:
         icao_codes: List of ICAO airport codes. Defaults to ~55 major African airports.
@@ -944,11 +949,20 @@ async def fetch_notams_autorouter(
     codes = icao_codes if icao_codes else DEFAULT_AFRICAN_AIRPORTS
     try:
         report = await asyncio.wait_for(
-            fetch_autorouter_notams(codes, start_validity, end_validity),
+            fetch_autorouter_notams(
+                codes,
+                AUTOROUTER_CLIENT_ID,
+                AUTOROUTER_CLIENT_SECRET,
+                start_validity,
+                end_validity,
+            ),
             timeout=180,
         )
     except asyncio.TimeoutError:
         return {"error": "Autorouter NOTAM fetch timed out after 180 seconds"}
+
+    if "error" in report and "notams" not in report:
+        return report
 
     cache_path = _write_notams_cache("NOTAMs Autorouter", report)
     if cache_path:

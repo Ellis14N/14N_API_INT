@@ -8,12 +8,19 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Iterable
 
 import httpx
 
-AUTOROUTER_URL = "https://www.autorouter.aero/notam/"
+# Autorouter — OAuth2 client_credentials, token TTL 1 hour. Wiki:
+#   https://www.autorouter.aero/wiki/api/authentication/
+#   https://www.autorouter.aero/wiki/api/notams
+AUTOROUTER_API_BASE = "https://api.autorouter.aero/v1.0"
+AUTOROUTER_URL = f"{AUTOROUTER_API_BASE}/notam"
+AUTOROUTER_TOKEN_URL = f"{AUTOROUTER_API_BASE}/oauth2/token"
+
 # SkyLink is fronted by RapidAPI. Host header is required by the gateway.
 SKYLINK_HOST = "skylink-api.p.rapidapi.com"
 SKYLINK_URL = f"https://{SKYLINK_HOST}/notams"
@@ -326,61 +333,103 @@ def _compute_active_upcoming(start_iso: str, end_iso: str) -> tuple[bool, bool]:
 # Autorouter
 # ---------------------------------------------------------------------------
 
-def _normalize_autorouter(item: dict, fallback_icao: str = "") -> dict | None:
-    """Map an Autorouter NOTAM record to the canonical schema."""
+# Token cache (process-lifetime). Token TTL is 1 hour per the wiki; we treat
+# anything within 60s of expiry as stale to avoid clock-skew 401s.
+_autorouter_token: str = ""
+_autorouter_token_expiry: float = 0.0
+_autorouter_token_lock: asyncio.Lock | None = None
+
+
+def _autorouter_token_invalidate() -> None:
+    global _autorouter_token, _autorouter_token_expiry
+    _autorouter_token = ""
+    _autorouter_token_expiry = 0.0
+
+
+async def _get_autorouter_token(
+    client: httpx.AsyncClient,
+    client_id: str,
+    client_secret: str,
+) -> str:
+    """OAuth2 client_credentials. client_id is the account email, client_secret the password."""
+    global _autorouter_token, _autorouter_token_expiry, _autorouter_token_lock
+    if _autorouter_token_lock is None:
+        _autorouter_token_lock = asyncio.Lock()
+    async with _autorouter_token_lock:
+        if _autorouter_token and time.time() < _autorouter_token_expiry - 60:
+            return _autorouter_token
+        resp = await client.post(
+            AUTOROUTER_TOKEN_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        _autorouter_token = payload["access_token"]
+        _autorouter_token_expiry = time.time() + int(payload.get("expires_in", 3600))
+        return _autorouter_token
+
+
+def _normalize_autorouter(item: dict, batch: list[str] | None = None) -> dict | None:
+    """Map an Autorouter NOTAM record (per /v1.0/notam wiki) to the canonical schema.
+
+    Wiki-documented fields:
+      itema (list[str])  — applicable ICAO codes
+      iteme (str)        — raw NOTAM text
+      type  (str)        — N | R | C
+      series (str), number (int), year (int) — used to build the standard ident
+      code23 (str), code45 (str) — split Q-code; reconstructed as Qxxxx
+      startvalidity / endvalidity (int) — Unix epoch; default end is 2^32-1 = "PERM"
+      id (int)           — autorouter internal stable ID, used for de-dup
+    """
     if not isinstance(item, dict):
         return None
-    icao = (
-        item.get("LocationIndicator")
-        or item.get("icao")
-        or item.get("itema")
-        or item.get("Icao")
-        or fallback_icao
-        or ""
-    ).strip().upper()
 
-    notam_id = (
-        item.get("Ident")
-        or item.get("id")
-        or item.get("NotamID")
-        or item.get("notamid")
-        or ""
-    )
+    # Pick the ICAO that matches our requested batch when possible
+    itema = item.get("itema") or []
+    icao = ""
+    if isinstance(itema, list) and itema:
+        upper = [str(c).strip().upper() for c in itema if c]
+        if batch:
+            matches = [c for c in upper if c in batch]
+            icao = matches[0] if matches else (upper[0] if upper else "")
+        else:
+            icao = upper[0] if upper else ""
 
-    type_raw = (item.get("Type") or item.get("type") or "").strip().upper()
+    # NOTAM standard ident: <series><number>/<YY> — fall back to internal id
+    series = item.get("series") or ""
+    number = item.get("number")
+    year = item.get("year")
+    if series and number is not None and year is not None:
+        notam_id = f"{series}{number}/{str(year)[-2:]}"
+    else:
+        notam_id = str(item.get("id") or "")
+
+    type_raw = (str(item.get("type") or "")).strip().upper()
     type_code = type_raw[0] if type_raw and type_raw[0] in ("N", "R", "C") else type_raw
 
-    start = _to_iso(
-        item.get("StartValidity")
-        or item.get("startvalidity")
-        or item.get("itemb")
-        or item.get("ValidFrom")
-    )
-    end_raw = (
-        item.get("EndValidity")
-        or item.get("endvalidity")
-        or item.get("itemc")
-        or item.get("ValidTo")
-    )
-    if isinstance(end_raw, str) and end_raw.strip().upper() in ("PERM", "PERMANENT"):
+    start = _to_iso(item.get("startvalidity"))
+    end_raw = item.get("endvalidity")
+    # Wiki: default endvalidity is 2^32-1 (≈ year 2106). Treat as permanent.
+    if isinstance(end_raw, (int, float)) and int(end_raw) >= (2**32 - 100):
         end = "PERM"
     else:
         end = _to_iso(end_raw)
 
-    text = (
-        item.get("Text")
-        or item.get("All")
-        or item.get("iteme")
-        or item.get("text")
-        or item.get("raw")
-        or ""
-    )
-    qcode = item.get("QCode") or item.get("qcode") or item.get("Q") or None
+    text = item.get("iteme") or ""
+
+    # Q-code is split: code23 = subject (chars 2-3), code45 = condition (chars 4-5)
+    code23 = (item.get("code23") or "").upper()
+    code45 = (item.get("code45") or "").upper()
+    qcode = f"Q{code23}{code45}" if (code23 or code45) else None
 
     is_active, is_upcoming = _compute_active_upcoming(start, end)
     return {
         "airport_icao": icao,
-        "notam_id": str(notam_id),
+        "notam_id": notam_id,
         "type": type_code,
         "effective_start": start,
         "effective_end": end,
@@ -395,6 +444,7 @@ def _normalize_autorouter(item: dict, fallback_icao: str = "") -> dict | None:
 async def _fetch_autorouter_batch(
     client: httpx.AsyncClient,
     icao_batch: list[str],
+    token: str,
     start_validity: int | None,
     end_validity: int | None,
 ) -> list[dict]:
@@ -407,13 +457,18 @@ async def _fetch_autorouter_batch(
     if end_validity is not None:
         params["endvalidity"] = int(end_validity)
 
-    resp = await client.get(AUTOROUTER_URL, params=params)
+    resp = await client.get(
+        AUTOROUTER_URL,
+        params=params,
+        headers={"Authorization": f"Bearer {token}"},
+    )
     resp.raise_for_status()
     payload = resp.json()
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        for key in ("notams", "data", "results", "items"):
+        # Wiki: top-level `rows` is the array; keep other keys as defensive fallbacks.
+        for key in ("rows", "notams", "data", "results", "items"):
             if isinstance(payload.get(key), list):
                 return payload[key]
     return []
@@ -421,20 +476,57 @@ async def _fetch_autorouter_batch(
 
 async def fetch_autorouter_notams(
     icao_codes: Iterable[str],
+    client_id: str,
+    client_secret: str,
     start_validity: int | None = None,
     end_validity: int | None = None,
 ) -> dict:
-    """Fetch NOTAMs from Autorouter, batching ICAO codes 5 per request."""
+    """Fetch NOTAMs from Autorouter, batching ICAO codes 5 per request.
+
+    `client_id` is the account email and `client_secret` is the password (per
+    Autorouter's OAuth2 client_credentials flow).
+    """
+    if not client_id or not client_secret:
+        return {
+            "error": "AUTOROUTER_CLIENT_ID / AUTOROUTER_CLIENT_SECRET not configured",
+            "message": "Set AUTOROUTER_CLIENT_ID (account email) and AUTOROUTER_CLIENT_SECRET (account password) in the environment.",
+        }
+
     codes = [c.strip().upper() for c in icao_codes if c and c.strip()]
     notams: list[dict] = []
     fetch_errors: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
     async with httpx.AsyncClient(timeout=60, headers={"User-Agent": "14N-API-INT/1.0"}) as client:
+        try:
+            token = await _get_autorouter_token(client, client_id, client_secret)
+        except Exception as e:
+            err = f"Autorouter auth failed: {type(e).__name__}: {e}"
+            logging.error(err)
+            for icao in codes:
+                fetch_errors.append({"icao": icao, "error": err})
+            return _build_report([], codes, fetch_errors, source="autorouter")
+
+        async def _fetch_with_retry(batch: list[str]) -> list[dict]:
+            """Run a batch; on 401 refresh token once and retry."""
+            nonlocal token
+            try:
+                return await _fetch_autorouter_batch(
+                    client, batch, token, start_validity, end_validity,
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 401:
+                    raise
+                _autorouter_token_invalidate()
+                token = await _get_autorouter_token(client, client_id, client_secret)
+                return await _fetch_autorouter_batch(
+                    client, batch, token, start_validity, end_validity,
+                )
+
         for i in range(0, len(codes), AUTOROUTER_BATCH_SIZE):
             batch = codes[i:i + AUTOROUTER_BATCH_SIZE]
             try:
-                items = await _fetch_autorouter_batch(client, batch, start_validity, end_validity)
+                items = await _fetch_with_retry(batch)
             except Exception as e:
                 logging.warning("Autorouter batch %s failed: %s", batch, e)
                 for icao in batch:
@@ -442,10 +534,10 @@ async def fetch_autorouter_notams(
                 continue
 
             for raw in items:
-                norm = _normalize_autorouter(raw)
+                norm = _normalize_autorouter(raw, batch=batch)
                 if not norm or not norm["airport_icao"]:
                     continue
-                # Filter to requested batch (defensive — some APIs return neighbours)
+                # Filter to requested batch (defensive — itema may include neighbours)
                 if norm["airport_icao"] not in batch:
                     continue
                 key = (norm["airport_icao"], norm["notam_id"])
