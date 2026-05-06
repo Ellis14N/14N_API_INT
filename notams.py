@@ -32,6 +32,10 @@ SKYLINK_LIMIT = 50
 SKYLINK_DELAY_S = 1.2
 SKYLINK_RETRY_DELAY_S = 5.0
 
+# Recency filter: keep only NOTAMs whose effective_start is within ±N days of
+# now. Drops both stale (long-running) NOTAMs and far-future scheduled ones.
+RECENT_WINDOW_DAYS = 7
+
 # Major African airports (one or two per country, capitals + key hubs).
 # Override per call by passing `icao_codes`.
 DEFAULT_AFRICAN_AIRPORTS: list[str] = [
@@ -305,6 +309,25 @@ def _to_iso(value) -> str:
     return str(value)
 
 
+def _is_within_recent_window(start_iso: str, window_days: int) -> bool:
+    """True if effective_start is within ±window_days of now (UTC).
+
+    NOTAMs with no parseable start time are excluded — we can't tell if
+    they're recent. PERM applies only to the end, so start is still parsed
+    normally for filtering.
+    """
+    if not start_iso or start_iso == "PERM":
+        return False
+    try:
+        start = datetime.fromisoformat(start_iso)
+    except ValueError:
+        return False
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return abs((start - now).total_seconds()) <= window_days * 86400
+
+
 def _compute_active_upcoming(start_iso: str, end_iso: str) -> tuple[bool, bool]:
     now = datetime.now(timezone.utc)
     start = None
@@ -480,11 +503,13 @@ async def fetch_autorouter_notams(
     client_secret: str,
     start_validity: int | None = None,
     end_validity: int | None = None,
+    window_days: int = RECENT_WINDOW_DAYS,
 ) -> dict:
     """Fetch NOTAMs from Autorouter, batching ICAO codes 5 per request.
 
     `client_id` is the account email and `client_secret` is the password (per
-    Autorouter's OAuth2 client_credentials flow).
+    Autorouter's OAuth2 client_credentials flow). `window_days` keeps only
+    NOTAMs whose effective_start is within ±N days of now (default 7).
     """
     if not client_id or not client_secret:
         return {
@@ -540,13 +565,16 @@ async def fetch_autorouter_notams(
                 # Filter to requested batch (defensive — itema may include neighbours)
                 if norm["airport_icao"] not in batch:
                     continue
+                # Recency filter — drop NOTAMs whose effective_start is outside ±window_days
+                if not _is_within_recent_window(norm["effective_start"], window_days):
+                    continue
                 key = (norm["airport_icao"], norm["notam_id"])
                 if key in seen:
                     continue
                 seen.add(key)
                 notams.append(norm)
 
-    return _build_report(notams, codes, fetch_errors, source="autorouter")
+    return _build_report(notams, codes, fetch_errors, source="autorouter", window_days=window_days)
 
 
 # ---------------------------------------------------------------------------
@@ -645,8 +673,13 @@ async def _fetch_skylink_one(
 async def fetch_skylink_notams(
     icao_codes: Iterable[str],
     api_key: str,
+    window_days: int = RECENT_WINDOW_DAYS,
 ) -> dict:
-    """Fetch NOTAMs from SkyLink, one airport per request, capped concurrency."""
+    """Fetch NOTAMs from SkyLink, one airport per request, capped concurrency.
+
+    `window_days` keeps only NOTAMs whose effective_start is within ±N days
+    of now (default 7).
+    """
     if not api_key:
         return {
             "error": "SKYLINK_API_KEY not configured",
@@ -680,13 +713,16 @@ async def fetch_skylink_notams(
             norm = _normalize_skylink(raw, fallback_icao=icao)
             if not norm or not norm["airport_icao"]:
                 continue
+            # Recency filter — drop NOTAMs whose effective_start is outside ±window_days
+            if not _is_within_recent_window(norm["effective_start"], window_days):
+                continue
             key = (norm["airport_icao"], norm["notam_id"])
             if key in seen:
                 continue
             seen.add(key)
             notams.append(norm)
 
-    return _build_report(notams, codes, fetch_errors, source="skylink")
+    return _build_report(notams, codes, fetch_errors, source="skylink", window_days=window_days)
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +734,7 @@ def _build_report(
     airports_queried: list[str],
     fetch_errors: list[dict],
     source: str,
+    window_days: int = RECENT_WINDOW_DAYS,
 ) -> dict:
     by_category: dict[str, int] = {}
     by_airport: dict[str, int] = {}
@@ -714,6 +751,7 @@ def _build_report(
     return {
         "report_date": datetime.now(timezone.utc).date().isoformat(),
         "source": source,
+        "recency_window_days": window_days,
         "airports_queried": airports_queried,
         "airports_with_data": sorted(by_airport.keys()),
         "fetch_errors": fetch_errors,

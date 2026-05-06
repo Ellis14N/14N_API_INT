@@ -14,6 +14,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from countries import ACLED_NAMES, resolve_country, AFRICAN_CANONICAL_NAMES
 from notams import (
     DEFAULT_AFRICAN_AIRPORTS,
+    RECENT_WINDOW_DAYS,
     fetch_autorouter_notams,
     fetch_skylink_notams,
 )
@@ -931,6 +932,7 @@ async def fetch_notams_autorouter(
     icao_codes: list[str] | None = None,
     start_validity: int | None = None,
     end_validity: int | None = None,
+    recent_days: int = RECENT_WINDOW_DAYS,
 ) -> dict:
     """Fetch NOTAMs from the Autorouter API for African airports.
 
@@ -942,9 +944,12 @@ async def fetch_notams_autorouter(
     date-stamped cache file.
 
     Args:
-        icao_codes: List of ICAO airport codes. Defaults to ~55 major African airports.
+        icao_codes: List of ICAO airport codes. Defaults to ~57 major African airports.
         start_validity: Optional Unix timestamp — only return NOTAMs active on/after this time.
         end_validity: Optional Unix timestamp — only return NOTAMs active on/before this time.
+        recent_days: Recency window in days; only NOTAMs whose effective_start
+            is within ±N days of now are kept (default 7). Pass a large value
+            (e.g. 365) to effectively disable the filter.
     """
     codes = icao_codes if icao_codes else DEFAULT_AFRICAN_AIRPORTS
     try:
@@ -955,6 +960,7 @@ async def fetch_notams_autorouter(
                 AUTOROUTER_CLIENT_SECRET,
                 start_validity,
                 end_validity,
+                window_days=recent_days,
             ),
             timeout=180,
         )
@@ -971,21 +977,27 @@ async def fetch_notams_autorouter(
 
 
 @mcp.tool()
-async def fetch_notams_skylink(icao_codes: list[str] | None = None) -> dict:
+async def fetch_notams_skylink(
+    icao_codes: list[str] | None = None,
+    recent_days: int = RECENT_WINDOW_DAYS,
+) -> dict:
     """Fetch NOTAMs from the SkyLink API for African airports.
 
     Requires SKYLINK_API_KEY environment variable. One airport per request,
-    fetched concurrently with a small concurrency cap. Per-airport failures
+    paced sequentially to respect RapidAPI rate limits. Per-airport failures
     are recorded under `fetch_errors`. Results are written to a date-stamped
     cache file.
 
     Args:
-        icao_codes: List of ICAO airport codes. Defaults to ~55 major African airports.
+        icao_codes: List of ICAO airport codes. Defaults to ~57 major African airports.
+        recent_days: Recency window in days; only NOTAMs whose effective_start
+            is within ±N days of now are kept (default 7). Pass a large value
+            (e.g. 365) to effectively disable the filter.
     """
     codes = icao_codes if icao_codes else DEFAULT_AFRICAN_AIRPORTS
     try:
         report = await asyncio.wait_for(
-            fetch_skylink_notams(codes, SKYLINK_API_KEY),
+            fetch_skylink_notams(codes, SKYLINK_API_KEY, window_days=recent_days),
             timeout=180,
         )
     except asyncio.TimeoutError:
