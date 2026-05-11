@@ -26,6 +26,10 @@ AUTOROUTER_TOKEN_URL = f"{AUTOROUTER_API_BASE}/oauth2/token"
 SKYLINK_HOST = "skylink-api.p.rapidapi.com"
 SKYLINK_URL = f"https://{SKYLINK_HOST}/notams"
 
+# Kill switch — when True, all SkyLink calls (cron + live MCP tool) are skipped.
+# Flip to False to resume. Used to avoid burning the monthly RapidAPI quota.
+SKYLINK_SUSPENDED = True
+
 AUTOROUTER_BATCH_SIZE = 5
 AUTOROUTER_LIMIT = 100
 SKYLINK_LIMIT = 50
@@ -749,6 +753,12 @@ async def fetch_skylink_notams(
     of now. This captures recently activated, currently active, and upcoming
     NOTAMs in one filter.
     """
+    if SKYLINK_SUSPENDED:
+        logging.warning("SkyLink calls suspended (SKYLINK_SUSPENDED=True) — returning empty payload")
+        return {
+            "error": "SkyLink calls suspended",
+            "message": "SkyLink fetching is currently suspended via the SKYLINK_SUSPENDED kill switch in notams.py to conserve RapidAPI quota. Flip the constant to False to resume.",
+        }
     if not api_key:
         return {
             "error": "SKYLINK_API_KEY not configured",

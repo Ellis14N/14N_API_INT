@@ -1,8 +1,10 @@
 name: Cache NOTAMs (SkyLink)
 
 on:
-  schedule:
-    - cron: '5 22 * * *'  # 22:05 UTC + ~6hr GitHub delay = 04:05 Morocco (UTC+1)
+  # Cron schedule SUSPENDED to preserve RapidAPI quota. Restore the line below
+  # AND flip SKYLINK_SUSPENDED back to False in notams.py to resume.
+  # schedule:
+  #   - cron: '5 22 * * *'  # 22:05 UTC + ~6hr GitHub delay = 04:05 Morocco (UTC+1)
   workflow_dispatch:        # allow manual trigger from GitHub UI
 
 permissions:
